@@ -2,6 +2,7 @@ import os
 import math
 import zipfile
 
+import cv2
 import gdown
 import numpy as np
 import pandas as pd
@@ -49,12 +50,14 @@ def first_name(description):
 # ---------------------------------------------------------------------------
 
 def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
-                size=2, shuffle=False, seed=0):
+                size=2, shuffle=False, seed=0, transform=None):
     """Plot images from a dataframe in a grid.
 
     title_cols: a column name or a list of column names to show above each image.
     n: how many images to show (default: all rows).
     shuffle: pick random rows instead of the first ones.
+    transform: optional function applied to each image before showing it,
+               e.g. transform=denoise_image to see the corrected version.
     """
     if shuffle:
         data = data.sample(frac=1, random_state=seed)
@@ -74,7 +77,9 @@ def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
     for i in range(len(data)):
         row = data.iloc[i]
         ax = axes[i]
-        image = Image.open(row[path_col]).convert('RGB')
+        image = np.array(Image.open(row[path_col]).convert('RGB'))
+        if transform is not None:
+            image = transform(image)
         ax.imshow(image)
         if title_cols:
             title = '\n'.join(first_name(row[c]) for c in title_cols)
@@ -173,3 +178,106 @@ def class_neighbor_ranks(text_features):
     np.fill_diagonal(similarity, -np.inf)       # a class is not its own neighbour
     ranks = (-similarity).argsort(axis=1).argsort(axis=1) + 1
     return ranks
+
+
+# ---------------------------------------------------------------------------
+# Image quality: detection
+# ---------------------------------------------------------------------------
+# All metrics are computed on the grayscale image (values 0-255).
+# The default thresholds are only starting points - look at the metric
+# distributions (e.g. quality.describe()) and the flagged images, then adjust.
+
+def noise_level(gray):
+    """How grainy the image is: the typical difference between the image and
+    a median-blurred copy of itself. Median blur removes speckle noise but keeps
+    edges, so what is left over is mostly noise. Higher = noisier.
+
+    We take the MEDIAN of the differences (not the average), so a few strong
+    edges or thin lines don't count as noise - noise is everywhere, edges are not.
+    The 1.4826 just turns the result into a standard-deviation-like number."""
+    smooth = cv2.medianBlur(gray, 3)
+    difference = np.abs(gray.astype(np.float32) - smooth.astype(np.float32))
+    return float(1.4826 * np.median(difference))
+
+
+def blur_level(gray):
+    """How sharp the image is: the variance of the Laplacian (an edge detector).
+    Sharp images have many strong edges -> high value. LOWER = blurrier."""
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def brightness_level(gray):
+    """Average pixel value: 0 = completely black, 255 = completely white."""
+    return float(gray.mean())
+
+
+def inspect_images(df, checks=('noise', 'blur', 'brightness'), path_col='path',
+                   noise_threshold=10, blur_threshold=100,
+                   dark_threshold=50, bright_threshold=205):
+    """Run the chosen quality checks on every image in df.
+
+    checks: any of 'noise', 'blur', 'brightness'.
+    Returns a DataFrame with the same index as df, holding the path, the metric
+    values and the boolean flags (is_noisy, is_blurry, is_dark, is_bright).
+    Merge it back with: df = df.join(quality.drop(columns='path'))
+    """
+    rows = []
+    for i in range(len(df)):
+        path = df[path_col].iloc[i]
+        gray = np.array(Image.open(path).convert('L'))   # 'L' = grayscale
+        row = {path_col: path}
+
+        if 'noise' in checks:
+            row['noise'] = noise_level(gray)
+            row['is_noisy'] = row['noise'] > noise_threshold
+
+        if 'blur' in checks:
+            row['blur'] = blur_level(gray)
+            row['is_blurry'] = row['blur'] < blur_threshold
+
+        if 'brightness' in checks:
+            row['brightness'] = brightness_level(gray)
+            row['is_dark'] = row['brightness'] < dark_threshold
+            row['is_bright'] = row['brightness'] > bright_threshold
+
+        rows.append(row)
+
+        if (i + 1) % 10000 == 0:
+            print(f"checked {i + 1} / {len(df)} images")
+
+    return pd.DataFrame(rows, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# Image quality: correction
+# ---------------------------------------------------------------------------
+# Each function takes an RGB image as a numpy array (height, width, 3) with
+# values 0-255 and returns a corrected image of the same shape.
+# They can be passed straight to plot_images(..., transform=...).
+
+def denoise_image(image, strength=10):
+    """Remove grain with OpenCV's non-local means filter.
+    Higher strength removes more noise but also more fine detail."""
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)       # OpenCV expects BGR order
+    clean = cv2.fastNlMeansDenoisingColored(bgr, None, strength, strength, 7, 21)
+    return cv2.cvtColor(clean, cv2.COLOR_BGR2RGB)
+
+
+def deblur_image(image, amount=1.0, radius=1.0):
+    """Sharpen with an 'unsharp mask':
+    sharp = image + amount * (image - blurred image).
+    The difference (image - blurred) is the edges, so this boosts the edges.
+    It cannot recover detail that was never there, it only makes edges crisper."""
+    blurred = cv2.GaussianBlur(image, (0, 0), radius)
+    return cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
+
+
+def adjust_brightness(image, target=128):
+    """Move the average brightness towards `target` with gamma correction.
+    Gamma brightens/darkens the mid-tones while keeping black black and
+    white white, so it looks more natural than just adding a constant."""
+    mean = np.array(Image.fromarray(image).convert('L')).mean()
+    mean = min(max(mean, 1), 254)                        # avoid log(0)
+    gamma = np.log(target / 255) / np.log(mean / 255)   # solves (mean/255)**gamma = target/255
+    corrected = 255 * (image / 255) ** gamma
+    return corrected.astype(np.uint8)
