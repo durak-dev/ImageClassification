@@ -281,3 +281,49 @@ def adjust_brightness(image, target=128):
     gamma = np.log(target / 255) / np.log(mean / 255)   # solves (mean/255)**gamma = target/255
     corrected = 255 * (image / 255) ** gamma
     return corrected.astype(np.uint8)
+
+
+def fix_flagged_images(df, out_folder='dataset_fixed', path_col='path',
+                       denoise_strength=10, deblur_amount=1.0, brightness_target=128):
+    """Apply the corrections to every flagged image and save the result as a new file.
+
+    Uses the flag columns from inspect_images (is_noisy, is_blurry, is_dark,
+    is_bright); a missing flag column is simply skipped.
+    The fixes run in this order: brightness -> denoise -> deblur.
+    (Denoise before sharpening, otherwise sharpening makes the noise stronger.)
+
+    The original files are not touched. Returns a copy of df where 'path' points
+    to the fixed file for corrected images, plus a 'was_fixed' column.
+    """
+    os.makedirs(out_folder, exist_ok=True)
+    df = df.copy()
+    df['was_fixed'] = False
+
+    def flag(row, name):
+        return name in row and bool(row[name])
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        too_dark_or_bright = flag(row, 'is_dark') or flag(row, 'is_bright')
+        noisy = flag(row, 'is_noisy')
+        blurry = flag(row, 'is_blurry')
+
+        if not (too_dark_or_bright or noisy or blurry):
+            continue                                    # nothing to fix, keep original
+
+        image = np.array(Image.open(row[path_col]).convert('RGB'))
+        if too_dark_or_bright:
+            image = adjust_brightness(image, target=brightness_target)
+        if noisy:
+            image = denoise_image(image, strength=denoise_strength)
+        if blurry:
+            image = deblur_image(image, amount=deblur_amount)
+
+        new_path = os.path.join(out_folder, os.path.basename(row[path_col]))
+        Image.fromarray(image).save(new_path, quality=95)
+
+        df.iloc[i, df.columns.get_loc(path_col)] = new_path
+        df.iloc[i, df.columns.get_loc('was_fixed')] = True
+
+    print(f"fixed {df['was_fixed'].sum()} of {len(df)} images -> saved in '{out_folder}'")
+    return df
