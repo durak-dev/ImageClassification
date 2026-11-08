@@ -1,9 +1,7 @@
 import os
 import math
-import zipfile
 
 import cv2
-import gdown
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -18,25 +16,19 @@ from transformers import CLIPModel, CLIPProcessor
 # Data loading
 # ---------------------------------------------------------------------------
 
-def download_dataset(url, zip_name='dataset.zip', folder='dataset_extracted'):
-    """Download the dataset zip from a Google Drive share link, extract it,
-    and return labels.csv as a dataframe with an extra 'path' column."""
-    file_id = url.split('/')[-2]
-    download_url = f'https://drive.google.com/uc?id={file_id}'
+def get_device():
+    """'cuda' if a CUDA GPU is available, otherwise 'cpu'."""
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if not os.path.exists(zip_name):
-        print("Downloading dataset...")
-        gdown.download(download_url, zip_name, quiet=True)
 
-    if not os.path.exists(folder):
-        print("Extracting files...")
-        with zipfile.ZipFile(zip_name, 'r') as zip_ref:
-            zip_ref.extractall(folder)
+def load_dataset(data_dir):
+    """Read labels.csv from the repository's data folder and return it as a
+    dataframe with an extra 'path' column pointing at each image file.
 
-    print("Extracted contents:", os.listdir(folder))
-
-    df = pd.read_csv(os.path.join(folder, 'labels.csv'))
-    df['path'] = folder + '/images/' + df['filename']
+    Expected layout:  <data_dir>/labels.csv  and  <data_dir>/images/<filename>
+    """
+    df = pd.read_csv(os.path.join(data_dir, 'labels.csv'))
+    df['path'] = df['filename'].map(lambda f: os.path.join(data_dir, 'images', f))
     return df
 
 
@@ -89,7 +81,7 @@ def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
     plt.show()
 
 
-def plot_class_counts(df, label_col='class_id', desc_col='description'):
+def plot_class_counts(df, label_col='class_id', desc_col='description', n_samples=4):
     """Bar chart of how many images each class has, sorted largest first."""
     counts = df.groupby(label_col).size().sort_values(ascending=False)
     desc = df.drop_duplicates(label_col).set_index(label_col)[desc_col]
@@ -97,8 +89,9 @@ def plot_class_counts(df, label_col='class_id', desc_col='description'):
     plt.figure(figsize=(14, 5))
     plt.bar(range(len(counts)), counts.values, width=1.0)
 
+    
     # label a few bars along the x axis so the plot is readable
-    positions = [len(counts) // 8, 3 * len(counts) // 8, 5 * len(counts) // 8, 7 * len(counts) // 8]
+    positions = [int((i+0.5)*2) * len(counts)//(n_samples * 2) for i in range(n_samples)]
     labels = [first_name(desc[counts.index[i]]) for i in positions]
     plt.xticks(positions, labels, rotation=45, ha='right')
 
@@ -132,7 +125,7 @@ def plot_confusion(y_true, y_pred, n_classes):
 
 def load_clip(name='openai/clip-vit-base-patch32'):
     """Load a CLIP model and its processor. Returns (model, processor, device)."""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = get_device()
     model = CLIPModel.from_pretrained(name).to(device).eval()
     processor = CLIPProcessor.from_pretrained(name)
     return model, processor, device
@@ -187,17 +180,27 @@ def class_neighbor_ranks(text_features):
 # The default thresholds are only starting points - look at the metric
 # distributions (e.g. quality.describe()) and the flagged images, then adjust.
 
-def noise_level(gray):
-    """How grainy the image is: the typical difference between the image and
-    a median-blurred copy of itself. Median blur removes speckle noise but keeps
-    edges, so what is left over is mostly noise. Higher = noisier.
+_NOISE_KERNEL = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float32)
 
-    We take the MEDIAN of the differences (not the average), so a few strong
-    edges or thin lines don't count as noise - noise is everywhere, edges are not.
-    The 1.4826 just turns the result into a standard-deviation-like number."""
-    smooth = cv2.medianBlur(gray, 3)
-    difference = np.abs(gray.astype(np.float32) - smooth.astype(np.float32))
-    return float(1.4826 * np.median(difference))
+
+def noise_level(gray, block=8, flat_fraction=0.2):
+    """Estimate the noise standard deviation (sigma, in gray levels 0-255).
+
+    Immerkaer's method: convolve with a kernel that cancels smooth image content
+    and straight edges, so what remains is mostly noise. Texture (fur, grass,
+    foliage) also survives that filter, so we only trust the FLATTEST blocks:
+    the image is cut into `block` x `block` tiles and only the `flat_fraction`
+    tiles with the weakest response are averaged. In flat areas there is nothing
+    but noise, so textured images are no longer mistaken for noisy ones.
+    Higher = noisier; roughly 1 for a clean image, 10+ for visibly grainy ones."""
+    response = np.abs(cv2.filter2D(gray.astype(np.float32), -1, _NOISE_KERNEL,
+                                   borderType=cv2.BORDER_REFLECT))[1:-1, 1:-1]
+    h = response.shape[0] - response.shape[0] % block
+    w = response.shape[1] - response.shape[1] % block
+    tiles = response[:h, :w].reshape(h // block, block, w // block, block).mean(axis=(1, 3)).ravel()
+    n_flat = max(1, int(len(tiles) * flat_fraction))
+    flat = np.sort(tiles)[:n_flat]
+    return float(np.sqrt(np.pi / 2) / 6 * flat.mean())
 
 
 def blur_level(gray):
@@ -206,19 +209,20 @@ def blur_level(gray):
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def brightness_level(gray):
-    """Average pixel value: 0 = completely black, 255 = completely white."""
-    return float(gray.mean())
+def contrast_level(gray):
+    """How much the image uses the available tonal range: the standard deviation
+    of the pixel values (RMS contrast). Low = flat / washed-out / foggy.
+    LOWER = less contrast."""
+    return float(gray.std())
 
 
-def inspect_images(df, checks=('noise', 'blur', 'brightness'), path_col='path',
-                   noise_threshold=10, blur_threshold=100,
-                   dark_threshold=50, bright_threshold=205):
+def inspect_images(df, checks=('noise', 'blur', 'contrast'), path_col='path',
+                   noise_threshold=5, blur_threshold=100, contrast_threshold=30):
     """Run the chosen quality checks on every image in df.
 
-    checks: any of 'noise', 'blur', 'brightness'.
+    checks: any of 'noise', 'blur', 'contrast'.
     Returns a DataFrame with the same index as df, holding the path, the metric
-    values and the boolean flags (is_noisy, is_blurry, is_dark, is_bright).
+    values and the boolean flags (is_noisy, is_blurry, is_low_contrast).
     Merge it back with: df = df.join(quality.drop(columns='path'))
     """
     rows = []
@@ -235,10 +239,9 @@ def inspect_images(df, checks=('noise', 'blur', 'brightness'), path_col='path',
             row['blur'] = blur_level(gray)
             row['is_blurry'] = row['blur'] < blur_threshold
 
-        if 'brightness' in checks:
-            row['brightness'] = brightness_level(gray)
-            row['is_dark'] = row['brightness'] < dark_threshold
-            row['is_bright'] = row['brightness'] > bright_threshold
+        if 'contrast' in checks:
+            row['contrast'] = contrast_level(gray)
+            row['is_low_contrast'] = row['contrast'] < contrast_threshold
 
         rows.append(row)
 
@@ -255,11 +258,20 @@ def inspect_images(df, checks=('noise', 'blur', 'brightness'), path_col='path',
 # values 0-255 and returns a corrected image of the same shape.
 # They can be passed straight to plot_images(..., transform=...).
 
-def denoise_image(image, strength=10):
+def denoise_image(image, strength=10, template_window=None, search_window=None):
     """Remove grain with OpenCV's non-local means filter.
-    Higher strength removes more noise but also more fine detail."""
+    `strength` (h) should be about the noise sigma: higher removes more noise
+    but also more fine detail.
+    Window sizes default to values scaled to the image size. The OpenCV defaults
+    (7 / 21) are tuned for large photos; on a 64x64 image they would average
+    over a big part of the whole picture and wash out detail."""
+    if template_window is None or search_window is None:
+        small = min(image.shape[:2]) <= 128
+        template_window = template_window or (3 if small else 7)
+        search_window = search_window or (11 if small else 21)
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)       # OpenCV expects BGR order
-    clean = cv2.fastNlMeansDenoisingColored(bgr, None, strength, strength, 7, 21)
+    clean = cv2.fastNlMeansDenoisingColored(bgr, None, strength, strength,
+                                            template_window, search_window)
     return cv2.cvtColor(clean, cv2.COLOR_BGR2RGB)
 
 
@@ -272,58 +284,127 @@ def deblur_image(image, amount=1.0, radius=1.0):
     return cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
 
 
-def adjust_brightness(image, target=128):
-    """Move the average brightness towards `target` with gamma correction.
-    Gamma brightens/darkens the mid-tones while keeping black black and
-    white white, so it looks more natural than just adding a constant."""
-    mean = np.array(Image.fromarray(image).convert('L')).mean()
-    mean = min(max(mean, 1), 254)                        # avoid log(0)
-    gamma = np.log(target / 255) / np.log(mean / 255)   # solves (mean/255)**gamma = target/255
-    corrected = 255 * (image / 255) ** gamma
-    return corrected.astype(np.uint8)
+def adjust_contrast(image, clip_limit=2.0, tile_grid=4):
+    """Boost local contrast with CLAHE (contrast-limited adaptive histogram
+    equalisation) on the lightness channel only, so colours are not shifted.
+    The image is split into tile_grid x tile_grid tiles that are equalised
+    separately; `clip_limit` caps how much a tile's histogram may be stretched,
+    which stops noise in flat areas from being blown up. Higher = stronger."""
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(tile_grid, tile_grid))
+    lab[..., 0] = clahe.apply(lab[..., 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def severity(ratio, max_ratio):
+    """Map a 'how many times worse than the threshold' ratio to a 0-1 severity.
+
+    Uses a log scale: noise and (especially) the Laplacian-variance blur score
+    span orders of magnitude, so a linear ratio would put nearly every image at
+    either the minimum or the cap. severity = log(ratio) / log(max_ratio):
+      ratio = 1 (right at the threshold) -> 0
+      ratio = max_ratio (or worse)       -> 1   (clipped, so it never explodes)
+    """
+    ratio = max(float(ratio), 1.0)
+    return float(np.clip(np.log(ratio) / np.log(max_ratio), 0.0, 1.0))
 
 
 def fix_flagged_images(df, out_folder='dataset_fixed', path_col='path',
-                       denoise_strength=10, deblur_amount=1.0, brightness_target=128):
-    """Apply the corrections to every flagged image and save the result as a new file.
+                       noise_threshold=5.0, blur_threshold=100.0, contrast_threshold=30.0,
+                       denoise_scale=0.8, denoise_range=(3.0, 15.0), noise_max_ratio=4.0,
+                       deblur_range=(0.5, 2.0), blur_max_ratio=10.0,
+                       clip_range=(1.0, 3.0), contrast_max_ratio=2.0,
+                       jpeg_quality=95):
+    """Apply corrections to every flagged image and save the result as a new file.
 
-    Uses the flag columns from inspect_images (is_noisy, is_blurry, is_dark,
-    is_bright); a missing flag column is simply skipped.
-    The fixes run in this order: brightness -> denoise -> deblur.
-    (Denoise before sharpening, otherwise sharpening makes the noise stronger.)
+    Uses the flag columns from inspect_images (is_noisy, is_blurry,
+    is_low_contrast) and the metric columns 'noise' / 'blur' / 'contrast'. Use the SAME thresholds
+    you gave to inspect_images.
+
+    Denoising (noise = estimated sigma, see noise_level):
+      * filter strength h = denoise_scale * sigma, clipped to denoise_range.
+        Non-local means expects h close to the noise sigma, so the strength
+        follows the measured noise directly.
+      * the denoised image is then BLENDED with the original:
+        out = alpha * denoised + (1 - alpha) * original, where alpha is the
+        severity (0-1, log scale, reaching 1 at noise_max_ratio x threshold),
+        floored at 0.3. Mild cases keep most of their detail and a wrong noise
+        estimate cannot destroy an image.
+    Sharpening (blur = Laplacian variance, lower = blurrier):
+      * amount = lo + severity * (hi - lo) with severity from threshold / blur on
+        a log scale (the score spans orders of magnitude); reduced by 25% when
+        the image is also noisy, because noise inflates the blur score.
+    Contrast (contrast = std of the pixel values, lower = flatter):
+      * CLAHE on the lightness channel; its clip limit goes from clip_range[0]
+        to clip_range[1] with a log-scale severity of threshold / contrast, and
+        the result is blended with the original by the same severity (floored
+        at 0.3) so a barely-low-contrast image is only nudged.
+    Order: denoise -> contrast -> sharpen, so later steps do not amplify grain.
 
     The original files are not touched. Returns a copy of df where 'path' points
-    to the fixed file for corrected images, plus a 'was_fixed' column.
+    to the fixed file for corrected images, plus 'was_fixed', 'orig_path',
+    'denoise_strength', 'denoise_blend', 'contrast_clip' and 'deblur_amount'
+    (0 = step not applied).
     """
     os.makedirs(out_folder, exist_ok=True)
     df = df.copy()
-    df['was_fixed'] = False
+    df['orig_path'] = df[path_col]
+    new_paths = df[path_col].tolist()
+    was_fixed = np.zeros(len(df), dtype=bool)
+    used_denoise = np.zeros(len(df))
+    used_blend = np.zeros(len(df))
+    used_deblur = np.zeros(len(df))
+    used_clip = np.zeros(len(df))
 
     def flag(row, name):
-        return name in row and bool(row[name])
+        return name in row.index and bool(row[name])
 
     for i in range(len(df)):
         row = df.iloc[i]
-        too_dark_or_bright = flag(row, 'is_dark') or flag(row, 'is_bright')
-        noisy = flag(row, 'is_noisy')
-        blurry = flag(row, 'is_blurry')
+        flat = flag(row, 'is_low_contrast') and 'contrast' in row.index
+        noisy = flag(row, 'is_noisy') and 'noise' in row.index
+        blurry = flag(row, 'is_blurry') and 'blur' in row.index
 
-        if not (too_dark_or_bright or noisy or blurry):
+        if not (flat or noisy or blurry):
             continue                                    # nothing to fix, keep original
 
         image = np.array(Image.open(row[path_col]).convert('RGB'))
-        if too_dark_or_bright:
-            image = adjust_brightness(image, target=brightness_target)
+
         if noisy:
-            image = denoise_image(image, strength=denoise_strength)
+            sigma = float(row['noise'])
+            h = float(np.clip(denoise_scale * sigma, *denoise_range))
+            alpha = max(0.3, severity(sigma / noise_threshold, noise_max_ratio))
+            cleaned = denoise_image(image, strength=h)
+            image = np.clip(alpha * cleaned + (1 - alpha) * image, 0, 255).astype(np.uint8)
+            used_denoise[i], used_blend[i] = h, alpha
+
+        if flat:
+            sev = severity(contrast_threshold / max(float(row['contrast']), 1e-6), contrast_max_ratio)
+            clip = clip_range[0] + sev * (clip_range[1] - clip_range[0])
+            alpha = max(0.3, sev)
+            boosted = adjust_contrast(image, clip_limit=clip)
+            image = np.clip(alpha * boosted + (1 - alpha) * image, 0, 255).astype(np.uint8)
+            used_clip[i] = clip
+
         if blurry:
-            image = deblur_image(image, amount=deblur_amount)
+            sev = severity(blur_threshold / max(float(row['blur']), 1e-6), blur_max_ratio)
+            amount = deblur_range[0] + sev * (deblur_range[1] - deblur_range[0])
+            if noisy:
+                amount *= 0.75
+            used_deblur[i] = amount
+            image = deblur_image(image, amount=amount)
 
         new_path = os.path.join(out_folder, os.path.basename(row[path_col]))
-        Image.fromarray(image).save(new_path, quality=95)
+        Image.fromarray(image).save(new_path, quality=jpeg_quality)
+        new_paths[i] = new_path
+        was_fixed[i] = True
 
-        df.iloc[i, df.columns.get_loc(path_col)] = new_path
-        df.iloc[i, df.columns.get_loc('was_fixed')] = True
+    df[path_col] = new_paths
+    df['was_fixed'] = was_fixed
+    df['denoise_strength'] = used_denoise
+    df['denoise_blend'] = used_blend
+    df['deblur_amount'] = used_deblur
+    df['contrast_clip'] = used_clip
 
-    print(f"fixed {df['was_fixed'].sum()} of {len(df)} images -> saved in '{out_folder}'")
+    print(f"fixed {was_fixed.sum()} of {len(df)} images -> saved in '{out_folder}'")
     return df

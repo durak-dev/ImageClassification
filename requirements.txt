@@ -1,0 +1,13 @@
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+pillow
+opencv-python
+torch
+torchvision
+transformers
+tensorflow
+jupyter
+ipykernel

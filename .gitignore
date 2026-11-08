@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+dataset_fixed/
+.ipynb_checkpoints/
