@@ -1,4 +1,11 @@
 __pycache__/
 *.pyc
-dataset_fixed/
 .ipynb_checkpoints/
+
+# generated from data/original + data/split_manifest.csv by the notebook
+data/train/
+data/val/
+data/test/
+
+# credentials - never commit
+.env

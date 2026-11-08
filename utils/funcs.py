@@ -1,5 +1,7 @@
 import os
 import math
+import shutil
+import hashlib
 
 import cv2
 import numpy as np
@@ -7,6 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import train_test_split
 
 import torch
 from transformers import CLIPModel, CLIPProcessor
@@ -21,15 +24,176 @@ def get_device():
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def load_dataset(data_dir):
-    """Read labels.csv from the repository's data folder and return it as a
-    dataframe with an extra 'path' column pointing at each image file.
+SPLITS = ('train', 'val', 'test')
+LABELS_FILE = 'labels.csv'                 # the label table inside data/original/labels/
+CORRECTED_LABELS_FILE = 'labels_corrected.csv'
 
-    Expected layout:  <data_dir>/labels.csv  and  <data_dir>/images/<filename>
-    """
-    df = pd.read_csv(os.path.join(data_dir, 'labels.csv'))
-    df['path'] = df['filename'].map(lambda f: os.path.join(data_dir, 'images', f))
+
+def file_hash(path, chunk_size=1 << 20):
+    """SHA-256 of the raw bytes of a file: identical files -> identical hash."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk_size), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
+                label_file=LABELS_FILE, stratify_col='class_id', reuse=True):
+    """Decide which split every raw image belongs to, BEFORE any preprocessing.
+
+    Reads  <orig_dir>/labels/<label_file>  (needs a 'filename' column) and the
+    images in <orig_dir>/images/.
+
+    1. Every image is hashed (SHA-256 of the file bytes).
+    2. Every image that has at least one byte-identical twin is QUARANTINED:
+       all instances of a duplicate group go to 'train', none to val/test, so
+       the same picture can never be in train and in val/test.
+    3. The remaining unique images are split in two steps (stratified by
+       `stratify_col`): train vs (val+test), then (val+test) -> val / test.
+       The val and test sizes are val_frac / test_frac of ALL images, so the
+       final ratios hold even though the quarantined images are added to train.
+
+    Returns (and saves to manifest_path) a table: filename, hash, is_duplicate, split.
+    If manifest_path already exists and reuse=True it is loaded instead, so the
+    whole team keeps the same split (delete the file to re-split)."""
+    labels = pd.read_csv(os.path.join(orig_dir, 'labels', label_file))
+    if 'filename' not in labels.columns:
+        raise ValueError(f"{label_file} needs a 'filename' column")
+    if labels['filename'].duplicated().any():
+        raise ValueError(f"{label_file} lists some filenames more than once")
+
+    if reuse and os.path.exists(manifest_path):
+        manifest = pd.read_csv(manifest_path)
+        if set(manifest['filename']) != set(labels['filename']):
+            raise ValueError(f"{manifest_path} does not match {label_file} (files were added or "
+                             "removed). Delete the manifest to create a new split.")
+        print(f"Reusing existing split from {manifest_path}")
+        print(manifest['split'].value_counts().to_string())
+        return manifest
+
+    image_dir = os.path.join(orig_dir, 'images')
+    missing = [f for f in labels['filename'] if not os.path.exists(os.path.join(image_dir, f))]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} images from {label_file} are missing in "
+                                f"{image_dir}, e.g. {missing[:3]}")
+    extra = set(os.listdir(image_dir)) - set(labels['filename'])
+    if extra:
+        print(f"Warning: {len(extra)} files in {image_dir} have no label and are ignored")
+
+    print(f"Hashing {len(labels)} images...")
+    df = labels.copy()
+    df['hash'] = [file_hash(os.path.join(image_dir, f)) for f in df['filename']]
+    df['is_duplicate'] = df.duplicated('hash', keep=False)      # keep=False: ALL instances
+
+    n_total = len(df)
+    n_val, n_test = round(val_frac * n_total), round(test_frac * n_total)
+    pool = df[~df['is_duplicate']]
+    if n_val + n_test >= len(pool):
+        raise ValueError("Not enough unique images for the requested val/test sizes")
+
+    def split_off(frame, n, strat_col):
+        """Take n rows out of `frame`; returns (rest, taken). Stratified if possible."""
+        strat = frame[strat_col] if strat_col in frame.columns else None
+        try:
+            return train_test_split(frame, test_size=n, random_state=seed, stratify=strat)
+        except ValueError as e:                    # e.g. a class with a single image
+            print(f"Warning: stratified split not possible ({e}); splitting without stratification")
+            return train_test_split(frame, test_size=n, random_state=seed)
+
+    train_part, temp = split_off(pool, n_val + n_test, stratify_col)
+    val_part, test_part = split_off(temp, n_test, stratify_col)
+
+    df['split'] = 'train'                                       # duplicates stay here
+    df.loc[val_part.index, 'split'] = 'val'
+    df.loc[test_part.index, 'split'] = 'test'
+
+    manifest = df[['filename', 'hash', 'is_duplicate', 'split']]
+    os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
+    manifest.to_csv(manifest_path, index=False)
+
+    groups = df[df['is_duplicate']]
+    print(f"{len(groups)} images belong to {groups['hash'].nunique()} duplicate groups "
+          f"-> all quarantined in train")
+    if stratify_col in df.columns and len(groups):
+        conflicting = (groups.groupby('hash')[stratify_col].nunique() > 1).sum()
+        if conflicting:
+            print(f"Warning: {conflicting} duplicate groups carry DIFFERENT labels - check them")
+    print((manifest['split'].value_counts() / n_total).round(3).to_string())
+    return manifest
+
+
+def split_dir(data_dir, split, sub):
+    """Path of data/<split>/<sub> (sub = 'images', 'labels' or 'images_corrected')."""
+    return os.path.join(data_dir, split, sub)
+
+
+def materialize_splits(orig_dir, data_dir, manifest, label_file=LABELS_FILE):
+    """Create data/{train,val,test}/{images,labels,images_corrected} and copy the
+    raw files of every split into images/ and labels/.
+
+    labels/ gets (a) the rows of the label table belonging to that split and
+    (b) any per-image label file in <orig_dir>/labels/ that has the same file
+    name stem as the image (e.g. image_1.JPEG <-> image_1.json).
+    Files that do not belong in a split (left over from an older split) are
+    removed from that split's folders, so a split can never contain another
+    split's images. Originals are never modified."""
+    labels = pd.read_csv(os.path.join(orig_dir, 'labels', label_file))
+    orig_labels = os.path.join(orig_dir, 'labels')
+    side_files = {os.path.splitext(f)[0]: f for f in os.listdir(orig_labels) if f != label_file}
+
+    for split in SPLITS:
+        names = list(manifest.loc[manifest['split'] == split, 'filename'])
+        keep_images = set(names)
+        stems = {os.path.splitext(n)[0] for n in names}
+        img_out, lab_out, fix_out = (split_dir(data_dir, split, d)
+                                     for d in ('images', 'labels', 'images_corrected'))
+        for d in (img_out, lab_out, fix_out):
+            os.makedirs(d, exist_ok=True)
+
+        # remove stale files (images moved to another split by a re-split)
+        for d, keep in ((img_out, keep_images), (fix_out, keep_images)):
+            for f in os.listdir(d):
+                if f not in keep:
+                    os.remove(os.path.join(d, f))
+        for f in os.listdir(lab_out):
+            if f not in (label_file, CORRECTED_LABELS_FILE) and os.path.splitext(f)[0] not in stems:
+                os.remove(os.path.join(lab_out, f))
+
+        for f in names:                                     # copy raw images
+            dst = os.path.join(img_out, f)
+            if not os.path.exists(dst):
+                shutil.copy2(os.path.join(orig_dir, 'images', f), dst)
+            stem = os.path.splitext(f)[0]
+            if stem in side_files and not os.path.exists(os.path.join(lab_out, side_files[stem])):
+                shutil.copy2(os.path.join(orig_labels, side_files[stem]), lab_out)
+
+        labels[labels['filename'].isin(keep_images)].to_csv(os.path.join(lab_out, label_file), index=False)
+        print(f"{split:5s}: {len(names)} images")
+
+    # safety net: no file may exist in two splits
+    seen = {}
+    for split in SPLITS:
+        for f in os.listdir(split_dir(data_dir, split, 'images')):
+            if f in seen:
+                raise RuntimeError(f"{f} is in both '{seen[f]}' and '{split}'")
+            seen[f] = split
+
+
+def load_split(data_dir, split, label_file=LABELS_FILE, image_folder='images'):
+    """Load one partition: the label table data/<split>/labels/<label_file> plus a
+    'path' column pointing into data/<split>/<image_folder>/ and a 'split' column.
+    Use image_folder='images_corrected' to read the restored images."""
+    df = pd.read_csv(os.path.join(split_dir(data_dir, split, 'labels'), label_file))
+    folder = split_dir(data_dir, split, image_folder)
+    df['path'] = df['filename'].map(lambda f: os.path.join(folder, f))
+    df['split'] = split
     return df
+
+
+def load_splits(data_dir, splits=SPLITS, **kwargs):
+    """All partitions in one dataframe (see load_split); the 'split' column tells them apart."""
+    return pd.concat([load_split(data_dir, s, **kwargs) for s in splits], ignore_index=True)
 
 
 def first_name(description):
@@ -309,12 +473,12 @@ def severity(ratio, max_ratio):
     return float(np.clip(np.log(ratio) / np.log(max_ratio), 0.0, 1.0))
 
 
-def fix_flagged_images(df, out_folder='dataset_fixed', path_col='path',
+def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
                        noise_threshold=5.0, blur_threshold=100.0, contrast_threshold=30.0,
                        denoise_scale=0.8, denoise_range=(3.0, 15.0), noise_max_ratio=4.0,
                        deblur_range=(0.5, 2.0), blur_max_ratio=10.0,
                        clip_range=(1.0, 3.0), contrast_max_ratio=2.0,
-                       jpeg_quality=95):
+                       jpeg_quality=95, copy_unflagged=True):
     """Apply corrections to every flagged image and save the result as a new file.
 
     Uses the flag columns from inspect_images (is_noisy, is_blurry,
@@ -341,8 +505,10 @@ def fix_flagged_images(df, out_folder='dataset_fixed', path_col='path',
         at 0.3) so a barely-low-contrast image is only nudged.
     Order: denoise -> contrast -> sharpen, so later steps do not amplify grain.
 
+    With copy_unflagged=True the unflagged images are copied unchanged into
+    out_folder, so out_folder holds the complete dataset (e.g. data/train/images_corrected).
     The original files are not touched. Returns a copy of df where 'path' points
-    to the fixed file for corrected images, plus 'was_fixed', 'orig_path',
+    to the file in out_folder, plus 'was_fixed', 'orig_path',
     'denoise_strength', 'denoise_blend', 'contrast_clip' and 'deblur_amount'
     (0 = step not applied).
     """
@@ -366,7 +532,11 @@ def fix_flagged_images(df, out_folder='dataset_fixed', path_col='path',
         blurry = flag(row, 'is_blurry') and 'blur' in row.index
 
         if not (flat or noisy or blurry):
-            continue                                    # nothing to fix, keep original
+            if copy_unflagged:                          # nothing to fix: copy unchanged
+                dst = os.path.join(out_folder, os.path.basename(row[path_col]))
+                shutil.copy2(row[path_col], dst)
+                new_paths[i] = dst
+            continue
 
         image = np.array(Image.open(row[path_col]).convert('RGB'))
 
