@@ -38,12 +38,22 @@ def file_hash(path, chunk_size=1 << 20):
     return h.hexdigest()
 
 
+def find_label_table(orig_dir, label_file=LABELS_FILE):
+    """Path of the label table: <orig_dir>/labels/<label_file> if a labels/ folder
+    exists, otherwise <orig_dir>/<label_file> directly."""
+    candidates = [os.path.join(orig_dir, 'labels', label_file), os.path.join(orig_dir, label_file)]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"{label_file} not found. Looked in: " + ", ".join(candidates))
+
+
 def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
                 label_file=LABELS_FILE, stratify_col='class_id', reuse=True):
     """Decide which split every raw image belongs to, BEFORE any preprocessing.
 
-    Reads  <orig_dir>/labels/<label_file>  (needs a 'filename' column) and the
-    images in <orig_dir>/images/.
+    Reads the label table (<orig_dir>/labels/<label_file> or <orig_dir>/<label_file>;
+    needs a 'filename' column) and the images in <orig_dir>/images/.
 
     1. Every image is hashed (SHA-256 of the file bytes).
     2. Every image that has at least one byte-identical twin is QUARANTINED:
@@ -57,7 +67,7 @@ def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
     Returns (and saves to manifest_path) a table: filename, hash, is_duplicate, split.
     If manifest_path already exists and reuse=True it is loaded instead, so the
     whole team keeps the same split (delete the file to re-split)."""
-    labels = pd.read_csv(os.path.join(orig_dir, 'labels', label_file))
+    labels = pd.read_csv(find_label_table(orig_dir, label_file))
     if 'filename' not in labels.columns:
         raise ValueError(f"{label_file} needs a 'filename' column")
     if labels['filename'].duplicated().any():
@@ -101,7 +111,7 @@ def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
             print(f"Warning: stratified split not possible ({e}); splitting without stratification")
             return train_test_split(frame, test_size=n, random_state=seed)
 
-    train_part, temp = split_off(pool, n_val + n_test, stratify_col)
+    _, temp = split_off(pool, n_val + n_test, stratify_col)     # the rest of the pool is train (default below)
     val_part, test_part = split_off(temp, n_test, stratify_col)
 
     df['split'] = 'train'                                       # duplicates stay here
@@ -133,14 +143,17 @@ def materialize_splits(orig_dir, data_dir, manifest, label_file=LABELS_FILE):
     raw files of every split into images/ and labels/.
 
     labels/ gets (a) the rows of the label table belonging to that split and
-    (b) any per-image label file in <orig_dir>/labels/ that has the same file
+    (b) any per-image label file in <orig_dir>/labels/ (if that folder exists) with the same file
     name stem as the image (e.g. image_1.JPEG <-> image_1.json).
     Files that do not belong in a split (left over from an older split) are
     removed from that split's folders, so a split can never contain another
     split's images. Originals are never modified."""
-    labels = pd.read_csv(os.path.join(orig_dir, 'labels', label_file))
-    orig_labels = os.path.join(orig_dir, 'labels')
-    side_files = {os.path.splitext(f)[0]: f for f in os.listdir(orig_labels) if f != label_file}
+    labels_path = find_label_table(orig_dir, label_file)
+    labels = pd.read_csv(labels_path)
+    orig_labels = os.path.dirname(labels_path)
+    # per-image label files only exist if there is a labels/ folder next to the table
+    side_files = ({os.path.splitext(f)[0]: f for f in os.listdir(orig_labels) if f != label_file}
+                  if os.path.basename(orig_labels) == 'labels' else {})
 
     for split in SPLITS:
         names = list(manifest.loc[manifest['split'] == split, 'filename'])
