@@ -28,28 +28,6 @@ LABELS_FILE = 'labels.csv'                 # the label table inside data/origina
 CORRECTED_LABELS_FILE = 'labels_corrected.csv'
 
 
-def image_signature(path, size=16):
-    """Small fingerprint of an image: grayscale, shrunk to size x size (this averages
-    away noise and blur), mean removed and scaled to length 1 (this removes brightness
-    and contrast). Returns an array of shape (8, size*size): the fingerprint of the
-    image rotated/mirrored in all 8 ways, so upside-down copies still match."""
-    gray = np.asarray(Image.open(path).convert('L'), dtype=np.float32)
-    small = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
-
-    versions = []
-    for k in range(4):
-        rotated = np.rot90(small, k)
-        versions.append(rotated)
-        versions.append(rotated[:, ::-1])           # mirrored
-
-    signatures = []
-    for v in versions:
-        v = v.ravel() - v.mean()
-        length = np.linalg.norm(v)
-        signatures.append(v / length if length > 1e-6 else np.zeros_like(v))
-    return np.array(signatures)
-
-
 def find_label_table(orig_dir, label_file=LABELS_FILE):
     """Path of the label table: <orig_dir>/labels/<label_file> if a labels/ folder
     exists, otherwise <orig_dir>/<label_file> directly."""
@@ -60,26 +38,84 @@ def find_label_table(orig_dir, label_file=LABELS_FILE):
     raise FileNotFoundError(f"{label_file} not found. Looked in: " + ", ".join(candidates))
 
 
-def mark_duplicates(df, image_dir, threshold=0.95, filename_col='filename'):
-    """Return a copy of df with two new columns: 'group' (look-alike images share an id)
-    and 'is_duplicate' (True if the image has at least one look-alike).
+def thumbnail(path, size=16):
+    """Tiny color version of an image, rescaled so that its mean is 0 and its standard
+    deviation is 1. That removes brightness and contrast; shrinking averages out noise
+    and blur. Differences are therefore measured in units of the image's own contrast."""
+    image = cv2.imread(path)
+    small = cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    return (small - small.mean()) / (small.std() + 1e-6)
 
-    Two images are look-alikes if one of them, rotated/mirrored in any of the 8 ways,
-    has a similarity >= threshold with the other (1.0 = identical look)."""
-    signatures = np.array([image_signature(os.path.join(image_dir, f), 16)
-                           for f in df[filename_col]])              # (n, 8, d)
-    original = signatures[:, 0, :]                                   # unrotated versions, (n, d)
-    n = len(df)
 
-    group = np.arange(n)                                             # every image starts alone
-    for i in range(n):
-        # similarity of image i (in all 8 orientations) to every image
-        similarity = (original @ signatures[i].T).max(axis=1)
-        for j in np.where(similarity >= threshold)[0]:
-            group[group == group[j]] = group[i]                      # merge j's group into i's
+def orientations(thumb):
+    """The 8 ways to turn an image: 4 rotations, each normal and mirrored.
+    Returns an array of shape (8, number of values in the thumbnail)."""
+    versions = []
+    for k in range(4):
+        rotated = np.rot90(thumb, k)
+        versions.append(rotated.ravel())
+        versions.append(rotated[:, ::-1].ravel())
+    return np.array(versions)
+
+
+def find_duplicate_pairs(df, image_dir, max_diff=0.12, filename_col='filename', chunk=64):
+    """Find pairs of images that look the same (also upside down, mirrored, noisier,
+    brighter, blurrier).
+
+    Every image becomes a 16x16 color thumbnail (see thumbnail). The 'diff' of two images is
+    the root-mean-square difference between their thumbnails, using the rotation/mirror
+    that fits best:  diff 0 = identical,  0.12 = on average 12% of the picture's own
+    contrast is different,  ~1.4 = unrelated. Pairs with diff <= max_diff are returned
+    as a DataFrame with columns a, b (filenames) and diff."""
+    thumbs = np.array([thumbnail(os.path.join(image_dir, f)) for f in df[filename_col]])
+    n = len(thumbs)
+    flat = thumbs.reshape(n, -1) / np.sqrt(thumbs[0].size)           # so that dot product = 1 - diff^2/2
+
+    names = list(df[filename_col])
+    rows = []
+    for start in range(0, n, chunk):                                 # a chunk of images at a time (memory)
+        turned = np.array([orientations(t) for t in thumbs[start:start + chunk]])
+        turned = turned.reshape(-1, flat.shape[1]) / np.sqrt(thumbs[0].size)
+        similarity = (turned @ flat.T).reshape(-1, 8, n).max(axis=1)  # best of the 8 orientations
+        diff = np.sqrt(np.maximum(2 - 2 * similarity, 0))             # RMS difference
+        for i, j in zip(*np.where(diff <= max_diff)):
+            if j > start + i:                                         # each pair once, not an image with itself
+                rows.append((names[start + i], names[j], diff[i, j]))
+    return pd.DataFrame(rows, columns=['a', 'b', 'diff'])
+
+
+def plot_pairs(pairs, image_dir, score_col, n=12, pairs_per_row=4, size=2):
+    """Show image pairs side by side with their score, for a visual check."""
+    pairs = pairs.head(n)
+    nrows = math.ceil(len(pairs) / pairs_per_row)
+    fig, axes = plt.subplots(nrows, pairs_per_row * 2, figsize=(pairs_per_row * 2 * size, nrows * size * 1.2),
+                             squeeze=False)
+    for ax in axes.flatten():
+        ax.axis('off')
+
+    for i, (_, row) in enumerate(pairs.iterrows()):
+        left = axes[i // pairs_per_row, (i % pairs_per_row) * 2]
+        right = axes[i // pairs_per_row, (i % pairs_per_row) * 2 + 1]
+        left.imshow(Image.open(os.path.join(image_dir, row['a'])).convert('RGB'))
+        right.imshow(Image.open(os.path.join(image_dir, row['b'])).convert('RGB'))
+        left.set_title(f"{row[score_col]:.2f}", fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
+def mark_duplicates(df, pairs, filename_col='filename'):
+    """Return a copy of df with 'group' (images linked by a pair share an id) and
+    'is_duplicate' (True if the image is in a pair). Pass the pairs you accept,
+    e.g. pairs[pairs.is_duplicate]."""
+    group = {name: i for i, name in enumerate(df[filename_col])}      # every image starts alone
+    for a, b in zip(pairs['a'], pairs['b']):
+        old, new = group[b], group[a]
+        for name in group:
+            if group[name] == old:
+                group[name] = new                                      # merge b's group into a's
 
     out = df.copy()
-    out['group'] = group
+    out['group'] = out[filename_col].map(group)
     out['is_duplicate'] = out.duplicated('group', keep=False)
     return out
 
