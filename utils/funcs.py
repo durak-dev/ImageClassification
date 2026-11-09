@@ -1,7 +1,6 @@
 import os
 import math
 import shutil
-import hashlib
 
 import cv2
 import numpy as np
@@ -29,13 +28,26 @@ LABELS_FILE = 'labels.csv'                 # the label table inside data/origina
 CORRECTED_LABELS_FILE = 'labels_corrected.csv'
 
 
-def file_hash(path, chunk_size=1 << 20):
-    """SHA-256 of the raw bytes of a file: identical files -> identical hash."""
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for block in iter(lambda: f.read(chunk_size), b''):
-            h.update(block)
-    return h.hexdigest()
+def image_signature(path, size=16):
+    """Small fingerprint of an image: grayscale, shrunk to size x size (this averages
+    away noise and blur), mean removed and scaled to length 1 (this removes brightness
+    and contrast). Returns an array of shape (8, size*size): the fingerprint of the
+    image rotated/mirrored in all 8 ways, so upside-down copies still match."""
+    gray = np.asarray(Image.open(path).convert('L'), dtype=np.float32)
+    small = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+
+    versions = []
+    for k in range(4):
+        rotated = np.rot90(small, k)
+        versions.append(rotated)
+        versions.append(rotated[:, ::-1])           # mirrored
+
+    signatures = []
+    for v in versions:
+        v = v.ravel() - v.mean()
+        length = np.linalg.norm(v)
+        signatures.append(v / length if length > 1e-6 else np.zeros_like(v))
+    return np.array(signatures)
 
 
 def find_label_table(orig_dir, label_file=LABELS_FILE):
@@ -48,15 +60,40 @@ def find_label_table(orig_dir, label_file=LABELS_FILE):
     raise FileNotFoundError(f"{label_file} not found. Looked in: " + ", ".join(candidates))
 
 
-def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
+def mark_duplicates(df, image_dir, threshold=0.95, filename_col='filename'):
+    """Return a copy of df with two new columns: 'group' (look-alike images share an id)
+    and 'is_duplicate' (True if the image has at least one look-alike).
+
+    Two images are look-alikes if one of them, rotated/mirrored in any of the 8 ways,
+    has a similarity >= threshold with the other (1.0 = identical look)."""
+    signatures = np.array([image_signature(os.path.join(image_dir, f), 16)
+                           for f in df[filename_col]])              # (n, 8, d)
+    original = signatures[:, 0, :]                                   # unrotated versions, (n, d)
+    n = len(df)
+
+    group = np.arange(n)                                             # every image starts alone
+    for i in range(n):
+        # similarity of image i (in all 8 orientations) to every image
+        similarity = (original @ signatures[i].T).max(axis=1)
+        for j in np.where(similarity >= threshold)[0]:
+            group[group == group[j]] = group[i]                      # merge j's group into i's
+
+    out = df.copy()
+    out['group'] = group
+    out['is_duplicate'] = out.duplicated('group', keep=False)
+    return out
+
+
+def make_splits(orig_dir, manifest_path, duplicates, val_frac=0.15, test_frac=0.15, seed=42,
                 label_file=LABELS_FILE, stratify_col='class_id', reuse=True):
     """Decide which split every raw image belongs to, BEFORE any preprocessing.
 
     Reads the label table (<orig_dir>/labels/<label_file> or <orig_dir>/<label_file>;
     needs a 'filename' column) and the images in <orig_dir>/images/.
 
-    1. Every image is hashed (SHA-256 of the file bytes).
-    2. Every image that has at least one byte-identical twin is QUARANTINED:
+    1. `duplicates` is your dataframe after mark_duplicates
+       (filename, group, is_duplicate); this function does no image comparison itself.
+    2. Every image that has at least one look-alike is QUARANTINED:
        all instances of a duplicate group go to 'train', none to val/test, so
        the same picture can never be in train and in val/test.
     3. The remaining unique images are split in two steps (stratified by
@@ -64,7 +101,7 @@ def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
        The val and test sizes are val_frac / test_frac of ALL images, so the
        final ratios hold even though the quarantined images are added to train.
 
-    Returns (and saves to manifest_path) a table: filename, hash, is_duplicate, split.
+    Returns (and saves to manifest_path) a table: filename, group, is_duplicate, split.
     If manifest_path already exists and reuse=True it is loaded instead, so the
     whole team keeps the same split (delete the file to re-split)."""
     labels = pd.read_csv(find_label_table(orig_dir, label_file))
@@ -91,10 +128,9 @@ def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
     if extra:
         print(f"Warning: {len(extra)} files in {image_dir} have no label and are ignored")
 
-    print(f"Hashing {len(labels)} images...")
-    df = labels.copy()
-    df['hash'] = [file_hash(os.path.join(image_dir, f)) for f in df['filename']]
-    df['is_duplicate'] = df.duplicated('hash', keep=False)      # keep=False: ALL instances
+    if set(duplicates['filename']) != set(labels['filename']):
+        raise ValueError("The duplicate table does not match the label table - rerun mark_duplicates")
+    df = labels.merge(duplicates[['filename', 'group', 'is_duplicate']], on='filename', how='left')
 
     n_total = len(df)
     n_val, n_test = round(val_frac * n_total), round(test_frac * n_total)
@@ -118,15 +154,15 @@ def make_splits(orig_dir, manifest_path, val_frac=0.15, test_frac=0.15, seed=42,
     df.loc[val_part.index, 'split'] = 'val'
     df.loc[test_part.index, 'split'] = 'test'
 
-    manifest = df[['filename', 'hash', 'is_duplicate', 'split']]
+    manifest = df[['filename', 'group', 'is_duplicate', 'split']]
     os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
     manifest.to_csv(manifest_path, index=False)
 
     groups = df[df['is_duplicate']]
-    print(f"{len(groups)} images belong to {groups['hash'].nunique()} duplicate groups "
+    print(f"{len(groups)} images belong to {groups['group'].nunique()} near-duplicate groups "
           f"-> all quarantined in train")
     if stratify_col in df.columns and len(groups):
-        conflicting = (groups.groupby('hash')[stratify_col].nunique() > 1).sum()
+        conflicting = (groups.groupby('group')[stratify_col].nunique() > 1).sum()
         if conflicting:
             print(f"Warning: {conflicting} duplicate groups carry DIFFERENT labels - check them")
     print((manifest['split'].value_counts() / n_total).round(3).to_string())
