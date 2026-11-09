@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
 
 import torch
 from transformers import CLIPModel, CLIPProcessor
@@ -663,3 +664,29 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
 
     print(f"fixed {was_fixed.sum()} of {len(df)} images -> saved in '{out_folder}'")
     return df
+
+
+class MacroF1(tf.keras.callbacks.Callback):
+    """Computes macro F1 on val_ds at the end of each epoch; stores it in logs['val_f1']."""
+    def __init__(self, val_ds):
+        super().__init__()
+        self.val_ds = val_ds
+        self.y_true = np.concatenate([y.numpy() for _, y in val_ds])   # labels fixed, val not shuffled
+
+    def on_epoch_end(self, epoch, logs=None):
+        y_pred = self.model.predict(self.val_ds, verbose=0).argmax(1)
+        f1 = f1_score(self.y_true, y_pred, average="macro")
+        if logs is not None:
+            logs["val_f1"] = f1                  # lands in history.history
+        print(f"  val macro-F1 {f1:.4f}")
+
+def plot_history(history):
+    h = history.history if hasattr(history, "history") else history
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
+    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
+    if "val_f1" in h:
+        ax[1].plot(h["val_f1"], color="C2", marker="o")
+        best = int(np.argmax(h["val_f1"]))
+        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
+    plt.tight_layout(); plt.show()
