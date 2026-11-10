@@ -7,22 +7,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from PIL import Image
-from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score
 
 import torch
-from transformers import CLIPModel, CLIPProcessor
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-
-def get_device():
-    """'cuda' if a CUDA GPU is available, otherwise 'cpu'."""
-    return 'cuda' if torch.cuda.is_available() else 'cpu'
-
 
 SPLITS = ('train', 'val', 'test')
 LABELS_FILE = 'labels.csv'                 # the label table inside data/original/labels/
@@ -83,25 +75,6 @@ def find_duplicate_pairs(df, image_dir, max_diff=0.12, filename_col='filename', 
             if j > start + i:                                         # each pair once, not an image with itself
                 rows.append((names[start + i], names[j], diff[i, j]))
     return pd.DataFrame(rows, columns=['a', 'b', 'diff'])
-
-
-def plot_pairs(pairs, image_dir, score_col, n=12, pairs_per_row=4, size=2):
-    """Show image pairs side by side with their score, for a visual check."""
-    pairs = pairs.head(n)
-    nrows = math.ceil(len(pairs) / pairs_per_row)
-    fig, axes = plt.subplots(nrows, pairs_per_row * 2, figsize=(pairs_per_row * 2 * size, nrows * size * 1.2),
-                             squeeze=False)
-    for ax in axes.flatten():
-        ax.axis('off')
-
-    for i, (_, row) in enumerate(pairs.iterrows()):
-        left = axes[i // pairs_per_row, (i % pairs_per_row) * 2]
-        right = axes[i // pairs_per_row, (i % pairs_per_row) * 2 + 1]
-        left.imshow(Image.open(os.path.join(image_dir, row['a'])).convert('RGB'))
-        right.imshow(Image.open(os.path.join(image_dir, row['b'])).convert('RGB'))
-        left.set_title(f"{row[score_col]:.2f}", fontsize=9)
-    plt.tight_layout()
-    plt.show()
 
 
 def mark_duplicates(df, pairs, filename_col='filename'):
@@ -266,20 +239,18 @@ def materialize_splits(orig_dir, data_dir, manifest, label_file=LABELS_FILE):
             seen[f] = split
 
 
-def load_split(data_dir, split, label_file=LABELS_FILE, image_folder='images'):
-    """Load one partition: the label table data/<split>/labels/<label_file> plus a
-    'path' column pointing into data/<split>/<image_folder>/ and a 'split' column.
+def load_splits(data_dir, splits=SPLITS, label_file=LABELS_FILE, image_folder='images'):
+    """All partitions in one dataframe: the label tables data/<split>/labels/<label_file>
+    plus a 'path' column pointing into data/<split>/<image_folder>/ and a 'split' column.
     Use image_folder='images_corrected' to read the restored images."""
-    df = pd.read_csv(os.path.join(split_dir(data_dir, split, 'labels'), label_file))
-    folder = split_dir(data_dir, split, image_folder)
-    df['path'] = df['filename'].map(lambda f: os.path.join(folder, f))
-    df['split'] = split
-    return df
-
-
-def load_splits(data_dir, splits=SPLITS, **kwargs):
-    """All partitions in one dataframe (see load_split); the 'split' column tells them apart."""
-    return pd.concat([load_split(data_dir, s, **kwargs) for s in splits], ignore_index=True)
+    parts = []
+    for split in splits:
+        df = pd.read_csv(os.path.join(split_dir(data_dir, split, 'labels'), label_file))
+        folder = split_dir(data_dir, split, image_folder)
+        df['path'] = df['filename'].map(lambda f: os.path.join(folder, f))
+        df['split'] = split
+        parts.append(df)
+    return pd.concat(parts, ignore_index=True)
 
 
 def first_name(description):
@@ -331,55 +302,9 @@ def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
     plt.show()
 
 
-def plot_class_counts(df, label_col='class_id', desc_col='description', n_samples=4):
-    """Bar chart of how many images each class has, sorted largest first."""
-    counts = df.groupby(label_col).size().sort_values(ascending=False)
-    desc = df.drop_duplicates(label_col).set_index(label_col)[desc_col]
-
-    plt.figure(figsize=(14, 5))
-    plt.bar(range(len(counts)), counts.values, width=1.0)
-
-    
-    # label a few bars along the x axis so the plot is readable
-    positions = [int((i+0.5)*2) * len(counts)//(n_samples * 2) for i in range(n_samples)]
-    labels = [first_name(desc[counts.index[i]]) for i in positions]
-    plt.xticks(positions, labels, rotation=45, ha='right')
-
-    plt.xlabel(f'{len(counts)} classes (sorted by size)')
-    plt.ylabel('Images')
-    plt.title('Images per class')
-    plt.tight_layout()
-    plt.show()
-    return counts
-
-
-def plot_confusion(y_true, y_pred, n_classes):
-    """Plot a row-normalised confusion matrix and return it.
-    Row i shows where the images of class i ended up (fractions sum to 1)."""
-    cm = confusion_matrix(y_true, y_pred, labels=range(n_classes))
-    cmn = cm / cm.sum(axis=1, keepdims=True)
-
-    plt.figure(figsize=(8, 8))
-    plt.imshow(cmn, cmap='viridis')
-    plt.colorbar(label='Fraction of class')
-    plt.xlabel('CLIP label')
-    plt.ylabel('Original label')
-    plt.title(f'Overall agreement: {np.mean(y_true == y_pred):.2%}')
-    plt.show()
-    return cmn
-
-
 # ---------------------------------------------------------------------------
 # CLIP (used to check the labels, not to train)
 # ---------------------------------------------------------------------------
-
-def load_clip(name='openai/clip-vit-base-patch32'):
-    """Load a CLIP model and its processor. Returns (model, processor, device)."""
-    device = get_device()
-    model = CLIPModel.from_pretrained(name).to(device).eval()
-    processor = CLIPProcessor.from_pretrained(name)
-    return model, processor, device
-
 
 def _normalize(output):
     """Make every feature vector length 1 so a dot product = cosine similarity.
@@ -408,19 +333,6 @@ def clip_image_features(model, processor, device, paths, batch_size=64):
             features = _normalize(model.get_image_features(**inputs))
         all_features.append(features.cpu())
     return torch.cat(all_features)
-
-
-def class_neighbor_ranks(text_features):
-    """For every pair of classes (i, j), how close j is to i in meaning.
-    ranks[i, j] == 1 means j is the class most similar to i, 2 the second most, etc.
-    Used to tell 'CLIP confused two similar classes' apart from 'label looks wrong'."""
-    T = text_features.float().numpy()
-    T = T - T.mean(axis=0)                      # remove the shared "a photo of a" part
-    T = T / np.linalg.norm(T, axis=1, keepdims=True)
-    similarity = T @ T.T
-    np.fill_diagonal(similarity, -np.inf)       # a class is not its own neighbour
-    ranks = (-similarity).argsort(axis=1).argsort(axis=1) + 1
-    return ranks
 
 
 # ---------------------------------------------------------------------------
@@ -453,27 +365,25 @@ def noise_level(gray, block=8, flat_fraction=0.2):
     return float(np.sqrt(np.pi / 2) / 6 * flat.mean())
 
 
-def blur_level(gray):
-    """How sharp the image is: the variance of the Laplacian (an edge detector).
-    Sharp images have many strong edges -> high value. LOWER = blurrier."""
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def contrast_level(gray):
-    """How much the image uses the available tonal range: the standard deviation
-    of the pixel values (RMS contrast). Low = flat / washed-out / foggy.
-    LOWER = less contrast."""
-    return float(gray.std())
-
-
 def inspect_images(df, checks=('noise', 'blur', 'contrast'), path_col='path',
-                   noise_threshold=5, blur_threshold=100, contrast_threshold=30):
+                   noise_threshold=2.0, blur_threshold=2.0, contrast_threshold=12.0,
+                   high_contrast_threshold=31.0):
     """Run the chosen quality checks on every image in df.
 
+    All scores (and thresholds) are in readable units:
+      noise    = grain: noise sigma as % of the 0-255 brightness range  (higher = grainier)
+                 ~0.5 clean, 2 slightly grainy, 4+ visibly grainy
+      blur     = sharpness: log10 of the Laplacian variance, 1 step = 10x  (LOWER = blurrier)
+                 ~1 very blurry, 2 soft, 4 sharp
+      contrast = brightness spread (std) as % of the 0-255 range  (lower = flatter)
+                 ~10 washed out, 20 normal, 30+ harsh
+
     checks: any of 'noise', 'blur', 'contrast'.
-    Returns a DataFrame with the same index as df, holding the path, the metric
-    values and the boolean flags (is_noisy, is_blurry, is_low_contrast).
-    Merge it back with: df = df.join(quality.drop(columns='path'))
+    noise_threshold: above this -> is_noisy.        blur_threshold: below this -> is_blurry.
+    contrast_threshold: below this -> is_low_contrast.
+    high_contrast_threshold: above this -> is_high_contrast.
+    Returns a DataFrame with the same index as df, holding the path, the scores
+    and the boolean flags. Merge it back with: df = df.join(quality.drop(columns='path'))
     """
     rows = []
     for i in range(len(df)):
@@ -482,16 +392,19 @@ def inspect_images(df, checks=('noise', 'blur', 'contrast'), path_col='path',
         row = {path_col: path}
 
         if 'noise' in checks:
-            row['noise'] = noise_level(gray)
+            row['noise'] = 100 * noise_level(gray) / 255
             row['is_noisy'] = row['noise'] > noise_threshold
 
         if 'blur' in checks:
-            row['blur'] = blur_level(gray)
+            # variance of the Laplacian (edge detector): sharp images have strong edges. LOWER = blurrier
+            row['blur'] = float(np.log10(max(cv2.Laplacian(gray, cv2.CV_64F).var(), 1e-6)))
             row['is_blurry'] = row['blur'] < blur_threshold
 
         if 'contrast' in checks:
-            row['contrast'] = contrast_level(gray)
+            # RMS contrast = std of the pixel values. LOWER = flatter / washed out, HIGHER = harsher
+            row['contrast'] = 100 * float(gray.std()) / 255
             row['is_low_contrast'] = row['contrast'] < contrast_threshold
+            row['is_high_contrast'] = row['contrast'] > high_contrast_threshold
 
         rows.append(row)
 
@@ -546,6 +459,17 @@ def adjust_contrast(image, clip_limit=2.0, tile_grid=4):
     return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
 
+def reduce_contrast(image, scale=0.8):
+    """Tone down harsh contrast: pull the lightness of every pixel towards the
+    image's average lightness, L = mean + scale * (L - mean). Only the lightness
+    channel changes, so colours are not shifted.
+    scale = 1 leaves the image unchanged, 0.8 keeps 80% of the contrast."""
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lightness = lab[..., 0]
+    lab[..., 0] = lightness.mean() + scale * (lightness - lightness.mean())
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+
 def severity(ratio, max_ratio):
     """Map a 'how many times worse than the threshold' ratio to a 0-1 severity.
 
@@ -560,19 +484,27 @@ def severity(ratio, max_ratio):
 
 
 def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
-                       noise_threshold=5.0, blur_threshold=100.0, contrast_threshold=30.0,
+                       noise_threshold=None, blur_threshold=None, contrast_threshold=None,
+                       high_contrast_threshold=None,
                        denoise_scale=0.8, denoise_range=(3.0, 15.0), noise_max_ratio=4.0,
-                       deblur_range=(0.5, 2.0), blur_max_ratio=10.0,
-                       clip_range=(1.0, 3.0), contrast_max_ratio=2.0,
+                       deblur_range=(0.5, 2.0), blur_max_drop=1.0,
+                       clip_range=(1.0, 3.0), contrast_max_ratio=2.0, min_contrast_scale=0.6,
                        jpeg_quality=95, copy_unflagged=True):
     """Apply corrections to every flagged image and save the result as a new file.
 
-    Uses the flag columns from inspect_images (is_noisy, is_blurry,
-    is_low_contrast) and the metric columns 'noise' / 'blur' / 'contrast'. Use the SAME thresholds
-    you gave to inspect_images.
+    Uses the flag columns from inspect_images (is_noisy, is_blurry, is_low_contrast,
+    is_high_contrast) and the score columns 'noise' / 'blur' / 'contrast', in the
+    readable units of inspect_images. Use the SAME thresholds you gave to inspect_images.
 
-    Denoising (noise = estimated sigma, see noise_level):
-      * filter strength h = denoise_scale * sigma, clipped to denoise_range.
+    Every step is OFF unless you pass its threshold:
+      noise_threshold -> denoise,            blur_threshold -> sharpen,
+      contrast_threshold -> boost contrast,  high_contrast_threshold -> reduce contrast.
+    e.g. fix_flagged_images(df, out, noise_threshold=2.0) only denoises.
+    An enabled step runs only for images whose flag is set, so clearing a flag in the
+    notebook (e.g. no contrast fix for noisy images) switches it off for that image.
+
+    Denoising (noise = grain %, converted back to the sigma in gray levels):
+      * filter strength h = denoise_scale * sigma, clipped to denoise_range (gray levels).
         Non-local means expects h close to the noise sigma, so the strength
         follows the measured noise directly.
       * the denoised image is then BLENDED with the original:
@@ -580,23 +512,28 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
         severity (0-1, log scale, reaching 1 at noise_max_ratio x threshold),
         floored at 0.3. Mild cases keep most of their detail and a wrong noise
         estimate cannot destroy an image.
-    Sharpening (blur = Laplacian variance, lower = blurrier):
-      * amount = lo + severity * (hi - lo) with severity from threshold / blur on
-        a log scale (the score spans orders of magnitude); reduced by 25% when
-        the image is also noisy, because noise inflates the blur score.
-    Contrast (contrast = std of the pixel values, lower = flatter):
+    Sharpening (blur = sharpness log10, lower = blurrier):
+      * amount = lo + severity * (hi - lo), severity = (threshold - sharpness) / blur_max_drop,
+        clipped to 0-1: full strength once an image is blur_max_drop log steps (default 1 = 10x)
+        below the threshold. Reduced by 25% when the image is also noisy, because noise
+        inflates the blur score.
+    Contrast (contrast = brightness spread %, lower = flatter):
       * CLAHE on the lightness channel; its clip limit goes from clip_range[0]
         to clip_range[1] with a log-scale severity of threshold / contrast, and
         the result is blended with the original by the same severity (floored
         at 0.3) so a barely-low-contrast image is only nudged.
+    Too much contrast (contrast > high_contrast_threshold):
+      * reduce_contrast with scale = high_contrast_threshold / contrast, i.e. the
+        image's contrast is brought back down to about the threshold; the scale is
+        never below min_contrast_scale, so no image loses more than 40% by default.
     Order: denoise -> contrast -> sharpen, so later steps do not amplify grain.
 
     With copy_unflagged=True the unflagged images are copied unchanged into
     out_folder, so out_folder holds the complete dataset (e.g. data/train/images_corrected).
     The original files are not touched. Returns a copy of df where 'path' points
     to the file in out_folder, plus 'was_fixed', 'orig_path',
-    'denoise_strength', 'denoise_blend', 'contrast_clip' and 'deblur_amount'
-    (0 = step not applied).
+    'denoise_strength', 'denoise_blend', 'contrast_clip', 'contrast_scale' and
+    'deblur_amount' (0 = step not applied).
     """
     os.makedirs(out_folder, exist_ok=True)
     df = df.copy()
@@ -607,17 +544,23 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
     used_blend = np.zeros(len(df))
     used_deblur = np.zeros(len(df))
     used_clip = np.zeros(len(df))
+    used_scale = np.zeros(len(df))
 
-    def flag(row, name):
-        return name in row.index and bool(row[name])
+    if all(t is None for t in (noise_threshold, blur_threshold, contrast_threshold, high_contrast_threshold)):
+        print("Warning: no threshold given, so no step is enabled - images are only copied")
+
+    def flag(row, name, threshold, score):
+        """True if this step is enabled (threshold given) and the image is flagged for it."""
+        return threshold is not None and name in row.index and score in row.index and bool(row[name])
 
     for i in range(len(df)):
         row = df.iloc[i]
-        flat = flag(row, 'is_low_contrast') and 'contrast' in row.index
-        noisy = flag(row, 'is_noisy') and 'noise' in row.index
-        blurry = flag(row, 'is_blurry') and 'blur' in row.index
+        noisy = flag(row, 'is_noisy', noise_threshold, 'noise')
+        blurry = flag(row, 'is_blurry', blur_threshold, 'blur')
+        flat = flag(row, 'is_low_contrast', contrast_threshold, 'contrast')
+        harsh = flag(row, 'is_high_contrast', high_contrast_threshold, 'contrast')
 
-        if not (flat or noisy or blurry):
+        if not (flat or harsh or noisy or blurry):
             if copy_unflagged:                          # nothing to fix: copy unchanged
                 dst = os.path.join(out_folder, os.path.basename(row[path_col]))
                 shutil.copy2(row[path_col], dst)
@@ -627,9 +570,9 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
         image = np.array(Image.open(row[path_col]).convert('RGB'))
 
         if noisy:
-            sigma = float(row['noise'])
+            sigma = float(row['noise']) * 255 / 100                 # grain % -> gray levels for the filter
             h = float(np.clip(denoise_scale * sigma, *denoise_range))
-            alpha = max(0.3, severity(sigma / noise_threshold, noise_max_ratio))
+            alpha = max(0.3, severity(float(row['noise']) / noise_threshold, noise_max_ratio))
             cleaned = denoise_image(image, strength=h)
             image = np.clip(alpha * cleaned + (1 - alpha) * image, 0, 255).astype(np.uint8)
             used_denoise[i], used_blend[i] = h, alpha
@@ -642,10 +585,15 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
             image = np.clip(alpha * boosted + (1 - alpha) * image, 0, 255).astype(np.uint8)
             used_clip[i] = clip
 
+        if harsh:
+            scale = float(np.clip(high_contrast_threshold / float(row['contrast']), min_contrast_scale, 1.0))
+            image = reduce_contrast(image, scale=scale)
+            used_scale[i] = scale
+
         if blurry:
-            sev = severity(blur_threshold / max(float(row['blur']), 1e-6), blur_max_ratio)
+            sev = float(np.clip((blur_threshold - float(row['blur'])) / blur_max_drop, 0.0, 1.0))
             amount = deblur_range[0] + sev * (deblur_range[1] - deblur_range[0])
-            if noisy:
+            if 'is_noisy' in row.index and bool(row['is_noisy']):   # noise inflates the blur score
                 amount *= 0.75
             used_deblur[i] = amount
             image = deblur_image(image, amount=amount)
@@ -661,32 +609,7 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
     df['denoise_blend'] = used_blend
     df['deblur_amount'] = used_deblur
     df['contrast_clip'] = used_clip
+    df['contrast_scale'] = used_scale
 
     print(f"fixed {was_fixed.sum()} of {len(df)} images -> saved in '{out_folder}'")
     return df
-
-
-class MacroF1(tf.keras.callbacks.Callback):
-    """Computes macro F1 on val_ds at the end of each epoch; stores it in logs['val_f1']."""
-    def __init__(self, val_ds):
-        super().__init__()
-        self.val_ds = val_ds
-        self.y_true = np.concatenate([y.numpy() for _, y in val_ds])   # labels fixed, val not shuffled
-
-    def on_epoch_end(self, epoch, logs=None):
-        y_pred = self.model.predict(self.val_ds, verbose=0).argmax(1)
-        f1 = f1_score(self.y_true, y_pred, average="macro")
-        if logs is not None:
-            logs["val_f1"] = f1                  # lands in history.history
-        print(f"  val macro-F1 {f1:.4f}")
-
-def plot_history(history):
-    h = history.history if hasattr(history, "history") else history
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
-    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
-    if "val_f1" in h:
-        ax[1].plot(h["val_f1"], color="C2", marker="o")
-        best = int(np.argmax(h["val_f1"]))
-        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
-    plt.tight_layout(); plt.show()

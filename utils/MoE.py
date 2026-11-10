@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score
 
 class MixtureOfExperts(layers.Layer):
     def __init__(self, n_experts, n_classes, hidden=128, balance=0.05, drop=0.0, **kw):
@@ -89,4 +90,31 @@ class GateMonitor(tf.keras.callbacks.Callback):
         # 1.0 = perfectly even, 0.0 = one expert takes everything
         self.entropy.append(float(-(u * np.log(u + 1e-9)).sum() / np.log(len(u))))
         print(f"  usage {u.round(2)}  wins {np.bincount(g.argmax(1), minlength=len(u))}")
+
+
+class MacroF1(tf.keras.callbacks.Callback):
+    """Computes macro F1 on val_ds at the end of each epoch; stores it in logs['val_f1']."""
+    def __init__(self, val_ds):
+        super().__init__()
+        self.val_ds = val_ds
+        self.y_true = np.concatenate([y.numpy() for _, y in val_ds])   # labels fixed, val not shuffled
+
+    def on_epoch_end(self, epoch, logs=None):
+        y_pred = self.model.predict(self.val_ds, verbose=0).argmax(1)
+        f1 = f1_score(self.y_true, y_pred, average="macro")
+        if logs is not None:
+            logs["val_f1"] = f1                  # lands in history.history
+        print(f"  val macro-F1 {f1:.4f}")
+
+
+def plot_history(history):
+    h = history.history if hasattr(history, "history") else history
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
+    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
+    if "val_f1" in h:
+        ax[1].plot(h["val_f1"], color="C2", marker="o")
+        best = int(np.argmax(h["val_f1"]))
+        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
+    plt.tight_layout(); plt.show()
 
