@@ -483,6 +483,29 @@ def severity(ratio, max_ratio):
     return float(np.clip(np.log(ratio) / np.log(max_ratio), 0.0, 1.0))
 
 
+# strength columns written by fix_flagged_images (0 = step not applied)
+FIX_COLUMNS = ('denoise_strength', 'denoise_blend', 'contrast_clip', 'contrast_blend',
+               'contrast_scale', 'deblur_amount')
+
+
+def apply_fixes(image, denoise_strength=0, denoise_blend=0, contrast_clip=0, contrast_blend=0,
+                contrast_scale=0, deblur_amount=0):
+    """Run the corrections with given strengths (0 = skip that step), in the order
+    denoise -> contrast -> sharpen. fix_flagged_images works the strengths out per
+    image; rebuild_corrected replays the stored ones."""
+    if denoise_strength:
+        cleaned = denoise_image(image, strength=denoise_strength)
+        image = np.clip(denoise_blend * cleaned + (1 - denoise_blend) * image, 0, 255).astype(np.uint8)
+    if contrast_clip:
+        boosted = adjust_contrast(image, clip_limit=contrast_clip)
+        image = np.clip(contrast_blend * boosted + (1 - contrast_blend) * image, 0, 255).astype(np.uint8)
+    if contrast_scale:
+        image = reduce_contrast(image, scale=contrast_scale)
+    if deblur_amount:
+        image = deblur_image(image, amount=deblur_amount)
+    return image
+
+
 def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
                        noise_threshold=None, blur_threshold=None, contrast_threshold=None,
                        high_contrast_threshold=None,
@@ -540,11 +563,7 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
     df['orig_path'] = df[path_col]
     new_paths = df[path_col].tolist()
     was_fixed = np.zeros(len(df), dtype=bool)
-    used_denoise = np.zeros(len(df))
-    used_blend = np.zeros(len(df))
-    used_deblur = np.zeros(len(df))
-    used_clip = np.zeros(len(df))
-    used_scale = np.zeros(len(df))
+    used = {c: np.zeros(len(df)) for c in FIX_COLUMNS}
 
     if all(t is None for t in (noise_threshold, blur_threshold, contrast_threshold, high_contrast_threshold)):
         print("Warning: no threshold given, so no step is enabled - images are only copied")
@@ -567,49 +586,85 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
                 new_paths[i] = dst
             continue
 
-        image = np.array(Image.open(row[path_col]).convert('RGB'))
+        s = dict.fromkeys(FIX_COLUMNS, 0.0)             # strengths for this image
 
         if noisy:
             sigma = float(row['noise']) * 255 / 100                 # grain % -> gray levels for the filter
-            h = float(np.clip(denoise_scale * sigma, *denoise_range))
-            alpha = max(0.3, severity(float(row['noise']) / noise_threshold, noise_max_ratio))
-            cleaned = denoise_image(image, strength=h)
-            image = np.clip(alpha * cleaned + (1 - alpha) * image, 0, 255).astype(np.uint8)
-            used_denoise[i], used_blend[i] = h, alpha
+            s['denoise_strength'] = float(np.clip(denoise_scale * sigma, *denoise_range))
+            s['denoise_blend'] = max(0.3, severity(float(row['noise']) / noise_threshold, noise_max_ratio))
 
         if flat:
             sev = severity(contrast_threshold / max(float(row['contrast']), 1e-6), contrast_max_ratio)
-            clip = clip_range[0] + sev * (clip_range[1] - clip_range[0])
-            alpha = max(0.3, sev)
-            boosted = adjust_contrast(image, clip_limit=clip)
-            image = np.clip(alpha * boosted + (1 - alpha) * image, 0, 255).astype(np.uint8)
-            used_clip[i] = clip
+            s['contrast_clip'] = clip_range[0] + sev * (clip_range[1] - clip_range[0])
+            s['contrast_blend'] = max(0.3, sev)
 
         if harsh:
-            scale = float(np.clip(high_contrast_threshold / float(row['contrast']), min_contrast_scale, 1.0))
-            image = reduce_contrast(image, scale=scale)
-            used_scale[i] = scale
+            s['contrast_scale'] = float(np.clip(high_contrast_threshold / float(row['contrast']),
+                                                min_contrast_scale, 1.0))
 
         if blurry:
             sev = float(np.clip((blur_threshold - float(row['blur'])) / blur_max_drop, 0.0, 1.0))
             amount = deblur_range[0] + sev * (deblur_range[1] - deblur_range[0])
             if 'is_noisy' in row.index and bool(row['is_noisy']):   # noise inflates the blur score
                 amount *= 0.75
-            used_deblur[i] = amount
-            image = deblur_image(image, amount=amount)
+            s['deblur_amount'] = amount
 
+        image = apply_fixes(np.array(Image.open(row[path_col]).convert('RGB')), **s)
         new_path = os.path.join(out_folder, os.path.basename(row[path_col]))
         Image.fromarray(image).save(new_path, quality=jpeg_quality)
         new_paths[i] = new_path
         was_fixed[i] = True
+        for c in FIX_COLUMNS:
+            used[c][i] = s[c]
 
     df[path_col] = new_paths
     df['was_fixed'] = was_fixed
-    df['denoise_strength'] = used_denoise
-    df['denoise_blend'] = used_blend
-    df['deblur_amount'] = used_deblur
-    df['contrast_clip'] = used_clip
-    df['contrast_scale'] = used_scale
+    for c in FIX_COLUMNS:
+        df[c] = used[c]
 
     print(f"fixed {was_fixed.sum()} of {len(df)} images -> saved in '{out_folder}'")
     return df
+
+
+def rebuild_corrected(fixes, data_dir, labels_corrected=None, jpeg_quality=95, overwrite=False):
+    """Recreate data/{split}/images_corrected/ (and labels_corrected.csv) on a fresh
+    machine such as Colab, without re-running the quality check or CLIP.
+
+    fixes: the df_fixed checkpoint (filename, split, was_fixed + the FIX_COLUMNS strengths).
+           Every image gets exactly the corrections stored for it; the rest are copied.
+    labels_corrected: optional table (filename, split, class_id, description), written as
+           data/{split}/labels/labels_corrected.csv. It is written last, so its presence
+           means the rebuild finished.
+    Needs data/{split}/images/ first: run materialize_splits(orig_dir, data_dir, manifest).
+    Files that already exist are skipped (overwrite=False), so an interrupted run can resume."""
+    fixes = fixes.copy()
+    if 'contrast_blend' not in fixes.columns:           # older checkpoints: same formula as fix_flagged_images
+        fixes['contrast_blend'] = np.where(fixes['contrast_clip'] > 0,
+                                           np.maximum(0.3, (fixes['contrast_clip'] - 1.0) / 2.0), 0.0)
+
+    for split, part in fixes.groupby('split'):
+        src_dir, out_dir = split_dir(data_dir, split, 'images'), split_dir(data_dir, split, 'images_corrected')
+        missing = set(part['filename']) - set(os.listdir(src_dir))
+        if missing:
+            raise RuntimeError(f"{len(missing)} images of the checkpoint are not in {src_dir} "
+                               "(was the checkpoint made with a different split_manifest.csv?)")
+        os.makedirs(out_dir, exist_ok=True)
+        written = 0
+        for _, row in part.iterrows():
+            src, dst = os.path.join(src_dir, row['filename']), os.path.join(out_dir, row['filename'])
+            if os.path.exists(dst) and not overwrite:
+                continue
+            if bool(row['was_fixed']):
+                image = np.array(Image.open(src).convert('RGB'))
+                image = apply_fixes(image, **{c: float(row.get(c, 0.0)) for c in FIX_COLUMNS})
+                Image.fromarray(image).save(dst, quality=jpeg_quality)
+            else:
+                shutil.copy2(src, dst)
+            written += 1
+        print(f"{split:5s}: {written} images written, {int(part['was_fixed'].sum())} of {len(part)} corrected -> {out_dir}")
+
+    if labels_corrected is not None:
+        for split, part in labels_corrected.groupby('split'):
+            part.drop(columns='split').to_csv(
+                os.path.join(split_dir(data_dir, split, 'labels'), CORRECTED_LABELS_FILE), index=False)
+        print('labels_corrected.csv written for', ', '.join(sorted(labels_corrected['split'].unique())))
