@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -107,14 +108,17 @@ class MacroF1(tf.keras.callbacks.Callback):
         print(f"  val macro-F1 {f1:.4f}")
 
 
-def plot_history(history):
-    h = history.history if hasattr(history, "history") else history
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
-    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
-    if "val_f1" in h:
-        ax[1].plot(h["val_f1"], color="C2", marker="o")
-        best = int(np.argmax(h["val_f1"]))
-        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
-    plt.tight_layout(); plt.show()
+def default_callbacks(val_ds, name="model", log_dir="history_logs", patience=8, gate=False):
+    """Standard callbacks for fit(): val macro-F1, a per-epoch history CSV
+    (log_dir/<name>.csv, survives a crashed Colab session) and early stopping.
+    gate=True also adds GateMonitor (MoE only). Returns (callbacks, gate_monitor or None).
+    MacroF1 must come before CSVLogger so that val_f1 ends up in the CSV."""
+    os.makedirs(log_dir, exist_ok=True)
+    mon = GateMonitor(val_ds) if gate else None
+    cbs = ([mon] if gate else []) + [
+        MacroF1(val_ds),
+        tf.keras.callbacks.CSVLogger(os.path.join(log_dir, f"{name}.csv")),
+        tf.keras.callbacks.EarlyStopping(patience=patience, restore_best_weights=True)]
+    return cbs, mon
+
 
