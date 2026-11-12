@@ -149,6 +149,13 @@ def save_csv(df, repo_path, root, to_github=False, message=None, index=False):
 
 def load_csv(repo_path, root, from_github=False, **read_kwargs):
     """Load a checkpoint written by save_csv (same flag value)."""
+    local = os.path.join(root, repo_path)
     if from_github:
-        return pd.read_csv(io.BytesIO(fetch_file(repo_path)), **read_kwargs)
-    return pd.read_csv(os.path.join(root, repo_path), **read_kwargs)
+        try:
+            return pd.read_csv(io.BytesIO(fetch_file(repo_path)), **read_kwargs)
+        except FileNotFoundError as e:
+            # not on the checkpoint branch: use the copy that came with the clone, if any
+            if not os.path.isfile(local):
+                raise
+            print(f"{e} - using the file from the cloned repo instead")
+    return pd.read_csv(local, **read_kwargs)
