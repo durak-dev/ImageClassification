@@ -17,6 +17,69 @@ def plot_history(history):
     plt.tight_layout(); plt.show()
 
 
+def _as_dict(run):
+    """A run can be a Keras History, a plain history dict, or a DataFrame (a CSV log read with pandas)."""
+    if hasattr(run, "history") and isinstance(run.history, dict):
+        return run.history
+    if hasattr(run, "to_dict"):
+        return run.to_dict("list")
+    return run
+
+
+def _first_key(h, *names):
+    """The first of these names that exists in the history."""
+    for name in names:
+        if name in h:
+            return name
+    raise KeyError(f"none of {names} found; the history has {list(h)}")
+
+
+def plot_comparison(runs):
+    """Compare several runs (cnn, moe, pmoe, mge, ...) in one figure: loss, val macro-F1, val accuracy.
+    runs: dict  name -> run,  where a run is a Keras History (what train.run returns),
+          a history dict, or a DataFrame read from a CSV log, e.g.
+          runs = {"cnn": hist_cnn, "moe": pd.read_csv("history_logs/moe_seed0.csv")}
+
+    The MGE model has several outputs, and its plain 'loss' is the SUM over all outputs, which cannot be
+    compared with the other models. For it the figure uses the loss and accuracy of its 'ensemble' output
+    (the average of the experts) instead, which are comparable. Also note that the MoE loss includes its
+    small balance penalty. For a gradual MGE run, dotted vertical lines mark where a new stage starts."""
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4))
+    for i, (name, run) in enumerate(runs.items()):
+        h = _as_dict(run)
+        color = f"C{i}"
+
+        train_loss = h[_first_key(h, "ensemble_loss", "loss")]
+        val_loss = h[_first_key(h, "val_ensemble_loss", "val_loss")]
+        val_acc = h[_first_key(h, "val_ensemble_accuracy", "val_accuracy")]
+        val_f1 = h["val_f1"]
+
+        label_f1 = f"{name} (best {max(val_f1):.3f})"
+        try:                                              # parameter count, only known for a History
+            label_f1 = f"{name} ({run.model.count_params() / 1e6:.2f}M params, best {max(val_f1):.3f})"
+        except Exception:
+            pass
+
+        ax[0].plot(val_loss, color=color, label=name)
+        ax[0].plot(train_loss, color=color, ls="--", alpha=0.5)          # dashed = train loss
+        ax[1].plot(val_f1, color=color, label=label_f1)
+        ax[2].plot(val_acc, color=color, label=f"{name} (best {max(val_acc):.3f})")
+
+        if "stage" in h:                                  # gradual MGE: mark the start of each new stage
+            stage = list(h["stage"])
+            for epoch in range(1, len(stage)):
+                if stage[epoch] != stage[epoch - 1]:
+                    for a in ax:
+                        a.axvline(epoch - 0.5, color=color, ls=":", alpha=0.6)
+
+    ax[0].set(title="Loss (solid = val, dashed = train)", xlabel="epoch")
+    ax[1].set(title="Val macro-F1", xlabel="epoch")
+    ax[2].set(title="Val accuracy", xlabel="epoch")
+    for a in ax:
+        a.legend(fontsize=8)
+    plt.tight_layout(); plt.show()
+
+
 def show_expert_patches(image, top_idx, grid, expert=None, ax=None):
     """Draw which patches the experts picked for ONE image.
     image   : (size, size, 3) array

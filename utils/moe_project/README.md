@@ -11,7 +11,7 @@ pmoe.py       PatchMoE layer + expert_choices() to read back which patches each 
 mge.py        depth experts, DiversityPenalty (add_loss), ensemble
 models.py     build_cnn, build_moe, build_pmoe, build_mge, build_mge_gradual (+ _compile)
 callbacks.py  GateMonitor, MacroF1, default_callbacks
-plotting.py   plot_history, show_expert_patches
+plotting.py   plot_history, plot_comparison (several runs in one figure), show_expert_patches
 train.py      run(model_name, seed, ...) and compare(...)
 ```
 

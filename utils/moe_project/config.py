@@ -11,13 +11,13 @@ without touching this file.
 
 # ---------------------------------------------------------------- data (fill in)
 IMG_SIZE = 64          # images are IMG_SIZE x IMG_SIZE x 3.  <-- set this to your size
-N_CLASSES = 10         # number of classes.                    <-- set this to your number
+N_CLASSES = 200         # number of classes.                    <-- set this to your number
 
 # ---------------------------------------------------------------- shared backbone
-DROP = 0.1             # spatial dropout inside the backbone (feature dropout = DROP * 2.5)
+DROP = 0.3             # spatial dropout inside the backbone (feature dropout = DROP * 2.5)
 
 # ---------------------------------------------------------------- shared by cnn / moe / pmoe
-N_EXPERTS = 4          # number of experts (cnn uses it only to size its dense head)
+N_EXPERTS = 8          # number of experts (cnn uses it only to size its dense head)
 HIDDEN = 128           # hidden units of ONE expert
 EXPERT_DROP = 0.3      # dropout inside the experts / dense head
 

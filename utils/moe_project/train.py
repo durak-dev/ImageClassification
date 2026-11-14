@@ -62,7 +62,8 @@ def run(model_name, seed, train_ds, val_ds, size=config.IMG_SIZE, n_classes=conf
         print(f"--- stage {number}/{len(stages)}: {len(model.outputs) - 1} expert(s)")
         stage_history = _fit(model, train_ds, val_ds, epochs if last else stage_epochs,
                              f"{run_name}_stage{number}", patience, log_dir)
-        for key in ("loss", "val_loss", "val_f1", "ensemble_accuracy", "val_ensemble_accuracy"):
+        for key in ("loss", "val_loss", "val_f1", "ensemble_loss", "val_ensemble_loss",
+                    "ensemble_accuracy", "val_ensemble_accuracy"):
             merged.history.setdefault(key, []).extend(stage_history.history[key])
         merged.history["stage"].extend([number] * len(stage_history.history["loss"]))
     merged.set_model(stages[-1])                     # history.model = the model with all experts
