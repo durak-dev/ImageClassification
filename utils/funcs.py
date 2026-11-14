@@ -668,3 +668,15 @@ def rebuild_corrected(fixes, data_dir, labels_corrected=None, jpeg_quality=95, o
             part.drop(columns='split').to_csv(
                 os.path.join(split_dir(data_dir, split, 'labels'), CORRECTED_LABELS_FILE), index=False)
         print('labels_corrected.csv written for', ', '.join(sorted(labels_corrected['split'].unique())))
+
+
+def plot_history(history):
+    h = history.history if hasattr(history, "history") else history
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
+    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
+    if "val_f1" in h:
+        ax[1].plot(h["val_f1"], color="C2", marker="o")
+        best = int(np.argmax(h["val_f1"]))
+        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
+    plt.tight_layout(); plt.show()
