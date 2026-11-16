@@ -257,6 +257,38 @@ def load_splits(data_dir, splits=SPLITS, label_file=LABELS_FILE, image_folder='i
     return pd.concat(parts, ignore_index=True)
 
 
+def balance_frame(df, strategy="oversample", target=None, label_col="class_id", seed=42):
+    """Class-balanced, shuffled copy of df (use on the TRAIN frame only).
+
+    strategy: None | "oversample" | "undersample"   (None returns df unchanged)
+    target:   images per class. None -> max class count (oversample) or min class
+              count (undersample). Also "min" | "median" | "max" | an int.
+              Any target both oversamples the small classes and undersamples the
+              big ones, e.g. target="median" is a hybrid that keeps the epoch size.
+    Oversampling keeps every row, adds whole repeats, then draws the remainder
+    without replacement, so each image is used about equally often."""
+    if strategy is None:
+        return df
+    if strategy not in ("oversample", "undersample"):
+        raise ValueError(f"strategy must be None, 'oversample' or 'undersample', got {strategy!r}")
+    counts = df[label_col].value_counts()
+    if target is None:
+        target = "max" if strategy == "oversample" else "min"
+    if isinstance(target, str):
+        target = {"min": counts.min(), "median": counts.median(), "max": counts.max()}[target]
+    target = int(target)
+
+    parts = []
+    for i, (_, g) in enumerate(df.groupby(label_col, sort=True)):
+        n = len(g)
+        if n >= target:
+            parts.append(g.sample(target, random_state=seed + i))
+        else:
+            reps, rest = divmod(target, n)
+            parts += [g] * reps + [g.sample(rest, random_state=seed + i)]
+    return pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # CLIP (used to check the labels, not to train)
 # ---------------------------------------------------------------------------

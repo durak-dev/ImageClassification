@@ -16,6 +16,19 @@ All of them output LOGITS (raw class scores), so compile them with from_logits=T
     MGEClassifier    experts at three depths of the backbone + diversity penalty (mge.py)
 
 Defaults come from config.py, but every value can be given as an argument instead.
+
+Your own backbone: every classifier takes `backbone=`. Leave it as None for the default network of
+backbone.py, or pass any callable that maps an image tensor to features (a function, or a Keras model):
+
+    base = tf.keras.applications.ResNet50(include_top=False, weights="imagenet", input_shape=(64, 64, 3))
+    model = PMoEClassifier(backbone=base, classes=200, l=8)
+
+What the backbone has to return depends on the classifier:
+    CNNClassifier, MoEClassifier   a vector (batch, F), or a feature map (batch, H, W, C) that is pooled
+    PMoEClassifier                 a feature map (batch, H, W, C)
+    MGEClassifier                  a list of exactly 3 feature maps, shallow to deep
+With a custom backbone, `drop` is not used (put dropout into your backbone) and no rescaling is added.
+`augmentation` still runs before it. Like `augmentation`, the backbone is not saved by get_config().
 """
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -39,6 +52,39 @@ def compile_default(model, lr=config.LR, weight_decay=config.WEIGHT_DECAY):
     return model
 
 
+def _custom_backbone(backbone_fn, inp, augmentation):
+    """Run a user-given backbone on the input. The classifier's `augmentation` (if any) still runs first;
+    the backbone is responsible for its own preprocessing (rescaling, normalisation, ...)."""
+    x = augmentation(inp) if augmentation is not None else inp
+    return backbone_fn(x)
+
+
+def _pooled_features(backbone_fn, inp, augmentation, drop):
+    """For CNN / MoE: a vector (batch, features). Default backbone.py network when backbone_fn is None.
+    A custom backbone may return a vector (used as is) or a feature map (batch, H, W, C), which is
+    globally average pooled."""
+    if backbone_fn is None:
+        return backbone(inp, augmentation, drop)
+    x = _custom_backbone(backbone_fn, inp, augmentation)
+    if len(x.shape) == 4:
+        x = layers.GlobalAveragePooling2D()(x)
+    if len(x.shape) != 2:
+        raise ValueError(f"backbone must return a feature vector (batch, F) or a feature map "
+                         f"(batch, H, W, C); got shape {tuple(x.shape)}")
+    return x
+
+
+def _feature_map(backbone_fn, inp, augmentation, drop):
+    """For pMoE: a feature map (batch, H, W, C). Default backbone.py network when backbone_fn is None."""
+    if backbone_fn is None:
+        return backbone_feature_map(inp, augmentation, drop)
+    x = _custom_backbone(backbone_fn, inp, augmentation)
+    if len(x.shape) != 4:
+        raise ValueError(f"PMoEClassifier needs a backbone that returns a feature map (batch, H, W, C), "
+                         f"not pooled features; got shape {tuple(x.shape)}")
+    return x
+
+
 def _plain(value):
     """Tuples/lists/trackers -> plain lists, so get_config() can be written to JSON."""
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -58,9 +104,9 @@ class CNNClassifier(tf.keras.Model):
 
     def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, classes=config.N_CLASSES,
                  n_experts=config.N_EXPERTS, hidden=config.HIDDEN, augmentation=None,
-                 drop=config.DROP, head_drop=config.EXPERT_DROP, name="cnn", **kwargs):
+                 drop=config.DROP, head_drop=config.EXPERT_DROP, backbone=None, name="cnn", **kwargs):
         inp = tf.keras.Input(input_shape)
-        x = backbone(inp, augmentation, drop)
+        x = _pooled_features(backbone, inp, augmentation, drop)
         x = layers.Dense(n_experts * hidden, activation="relu")(x)
         x = layers.Dropout(head_drop)(x)
         out = layers.Dense(classes)(x)
@@ -84,9 +130,9 @@ class MoEClassifier(tf.keras.Model):
     def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, classes=config.N_CLASSES,
                  n_experts=config.N_EXPERTS, hidden=config.HIDDEN, balance=config.BALANCE,
                  augmentation=None, drop=config.DROP, expert_drop=config.EXPERT_DROP,
-                 name="moe_model", **kwargs):
+                 backbone=None, name="moe_model", **kwargs):
         inp = tf.keras.Input(input_shape)
-        x = backbone(inp, augmentation, drop)
+        x = _pooled_features(backbone, inp, augmentation, drop)
         out = MixtureOfExperts(n_experts, classes, hidden=hidden, balance=balance, drop=expert_drop,
                                name="moe")(x)
         super().__init__(inp, out, name=name, **kwargs)
@@ -110,9 +156,9 @@ class PMoEClassifier(tf.keras.Model):
     def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, classes=config.N_CLASSES,
                  n_experts=config.N_EXPERTS, l=config.L_PATCHES, hidden=config.PMOE_HIDDEN,
                  augmentation=None, drop=config.DROP, expert_drop=config.EXPERT_DROP,
-                 name="pmoe_model", **kwargs):
+                 backbone=None, name="pmoe_model", **kwargs):
         inp = tf.keras.Input(input_shape)
-        x = backbone_feature_map(inp, augmentation, drop)
+        x = _feature_map(backbone, inp, augmentation, drop)
         out = PatchMoE(n_experts, classes, l=l, hidden=hidden, drop=expert_drop, name="pmoe")(x)
         super().__init__(inp, out, name=name, **kwargs)
         self._settings = dict(input_shape=input_shape, classes=classes, n_experts=n_experts, l=l,
@@ -168,8 +214,8 @@ class MGEClassifier(_MultiOutputModel):
     def __init__(self, input_shape=DEFAULT_INPUT_SHAPE, classes=config.N_CLASSES,
                  diversity_weight=config.DIVERSITY_WEIGHT, direction=config.DIVERSITY_DIRECTION,
                  order=config.MGE_ORDER, augmentation=None, drop=config.DROP,
-                 expert_drop=config.EXPERT_DROP, name="mge", **kwargs):
-        inp, expert_scores = mge_graph(input_shape, classes, augmentation, drop, expert_drop)
+                 expert_drop=config.EXPERT_DROP, backbone=None, name="mge", **kwargs):
+        inp, expert_scores = mge_graph(input_shape, classes, augmentation, drop, expert_drop, backbone)
         outputs = mge_outputs(expert_scores, list(order), diversity_weight, direction)
         super().__init__(inp, outputs, name=name, **kwargs)
         self._settings = dict(input_shape=input_shape, classes=classes, diversity_weight=diversity_weight,

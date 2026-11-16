@@ -14,7 +14,7 @@ IMG_SIZE = 64          # images are IMG_SIZE x IMG_SIZE x 3.  <-- set this to yo
 N_CLASSES = 200         # number of classes.                    <-- set this to your number
 
 # ---------------------------------------------------------------- shared backbone
-DROP = 0.3             # spatial dropout inside the backbone (feature dropout = DROP * 2.5)
+DROP = 0.2             # spatial dropout inside the backbone (feature dropout = DROP * 2.5)
 
 # ---------------------------------------------------------------- shared by cnn / moe / pmoe
 N_EXPERTS = 8          # number of experts (cnn uses it only to size its dense head)
@@ -37,7 +37,7 @@ MGE_STAGE_EPOCHS = 5       # gradual version only: epochs for each stage before 
 # ---------------------------------------------------------------- training
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-EPOCHS = 40
+EPOCHS = 60
 PATIENCE = 8           # early stopping patience (epochs)
 SEEDS = (0, 1, 2)      # the seeds compare() loops over
 LOG_DIR = "history_logs"   # per-epoch history CSVs are written here

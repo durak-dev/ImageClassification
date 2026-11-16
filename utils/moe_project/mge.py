@@ -38,11 +38,19 @@ def mge_expert(feature_map, n_classes, expert_drop, index):
     return layers.Dense(n_classes, name=f"expert_{index}_classifier")(x)     # scores (logits)
 
 
-def mge_graph(input_shape, classes, augmentation=None, drop=0.1, expert_drop=0.3):
-    """Backbone + one expert at each of the three depths (64, 128, 256 channels).
-    Returns (input, [scores_0, scores_1, scores_2]); expert 0 is the shallowest, 2 the deepest."""
+def mge_graph(input_shape, classes, augmentation=None, drop=0.1, expert_drop=0.3, backbone=None):
+    """Backbone + one expert at each of the three depths (64, 128, 256 channels by default).
+    Returns (input, [scores_0, scores_1, scores_2]); expert 0 is the shallowest, 2 the deepest.
+    backbone: None for backbone_multi_depth(), or your own callable returning a list of 3 feature maps
+    (batch, H, W, C), shallow to deep."""
     inp = tf.keras.Input(input_shape)
-    stages = backbone_multi_depth(inp, augmentation, drop)
+    if backbone is None:
+        stages = backbone_multi_depth(inp, augmentation, drop)
+    else:
+        stages = backbone(augmentation(inp) if augmentation is not None else inp)
+        if not isinstance(stages, (list, tuple)) or len(stages) != 3 or any(len(s.shape) != 4 for s in stages):
+            raise ValueError("MGEClassifier needs a backbone that returns a list of exactly 3 feature maps "
+                             "(batch, H, W, C), shallow to deep")
     expert_scores = [mge_expert(stage, classes, expert_drop, i) for i, stage in enumerate(stages)]
     return inp, expert_scores
 

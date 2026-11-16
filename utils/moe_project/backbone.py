@@ -13,7 +13,7 @@ def res_block(x, filters, downsample=True):
     stride = 2 if downsample else 1
     shortcut = x
     y = layers.Conv2D(filters, 3, strides=stride, padding="same", use_bias=False)(x)
-    y = layers.BatchNormalization()(y)
+    y = layers.BatchNormalization(gamma_initializer="zeros")(y)
     y = layers.ReLU()(y)
     y = layers.Conv2D(filters, 3, padding="same", use_bias=False)(y)
     y = layers.BatchNormalization()(y)
