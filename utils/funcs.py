@@ -11,6 +11,10 @@ from sklearn.model_selection import train_test_split
 
 import torch
 
+# Plotting lives in utils/plotting.py now. Re-exported here so older notebooks that do
+# `from utils.funcs import *` (plot_images, plot_history, first_name) keep working.
+from utils.plotting import plot_images, plot_history, first_name  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -251,55 +255,6 @@ def load_splits(data_dir, splits=SPLITS, label_file=LABELS_FILE, image_folder='i
         df['split'] = split
         parts.append(df)
     return pd.concat(parts, ignore_index=True)
-
-
-def first_name(description):
-    """'tabby, tabby cat' -> 'tabby'"""
-    return str(description).split(',')[0]
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
-                size=2, shuffle=False, seed=0, transform=None):
-    """Plot images from a dataframe in a grid.
-
-    title_cols: a column name or a list of column names to show above each image.
-    n: how many images to show (default: all rows).
-    shuffle: pick random rows instead of the first ones.
-    transform: optional function applied to each image before showing it,
-               e.g. transform=denoise_image to see the corrected version.
-    """
-    if shuffle:
-        data = data.sample(frac=1, random_state=seed)
-    if n is not None:
-        data = data.head(n)
-    if isinstance(title_cols, str):
-        title_cols = [title_cols]
-
-    nrows = math.ceil(len(data) / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * size, nrows * size * 1.1),
-                             squeeze=False)
-    axes = axes.flatten()
-
-    for ax in axes:
-        ax.axis('off')
-
-    for i in range(len(data)):
-        row = data.iloc[i]
-        ax = axes[i]
-        image = np.array(Image.open(row[path_col]).convert('RGB'))
-        if transform is not None:
-            image = transform(image)
-        ax.imshow(image)
-        if title_cols:
-            title = '\n'.join(first_name(row[c]) for c in title_cols)
-            ax.set_title(title, fontsize=8)
-
-    plt.tight_layout()
-    plt.show()
 
 
 # ---------------------------------------------------------------------------
@@ -668,15 +623,3 @@ def rebuild_corrected(fixes, data_dir, labels_corrected=None, jpeg_quality=95, o
             part.drop(columns='split').to_csv(
                 os.path.join(split_dir(data_dir, split, 'labels'), CORRECTED_LABELS_FILE), index=False)
         print('labels_corrected.csv written for', ', '.join(sorted(labels_corrected['split'].unique())))
-
-
-def plot_history(history):
-    h = history.history if hasattr(history, "history") else history
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
-    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
-    if "val_f1" in h:
-        ax[1].plot(h["val_f1"], color="C2", marker="o")
-        best = int(np.argmax(h["val_f1"]))
-        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
-    plt.tight_layout(); plt.show()

@@ -3,7 +3,7 @@
 Nothing else in this folder reads this file on its own: only models.py and
 train.py import it, and they use these values as DEFAULT arguments. So every
 builder can still be called with different values, e.g.
-    build_pmoe(size, n_classes, n_experts=8, l=4)
+    PMoEClassifier(input_shape, classes, n_experts=8, l=4)
 without touching this file.
 
 (Note: this is NOT utils/config.py, which holds the GitHub settings.)

@@ -103,7 +103,7 @@ def expert_choices(model, images, layer_name="pmoe"):
         top_idx : numpy (batch, k, l)  patch numbers, counted row by row on the patch grid
         gates   : numpy (batch, k, l)  the gate value of each kept patch
         grid    : (H, W) of the patch grid, so patch p sits at row p // W, column p % W
-    Works on any model built with build_pmoe (the layer is called "pmoe")."""
+    Works on any PMoEClassifier (its patch-routing layer is called "pmoe")."""
     layer = model.get_layer(layer_name)
     to_feature_map = tf.keras.Model(model.input, layer.input)         # image -> feature map
     feature_map = to_feature_map.predict(images, verbose=0)
