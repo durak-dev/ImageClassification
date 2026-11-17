@@ -21,7 +21,9 @@ What is here
   mge_graph()          backbone + 3 experts (one per depth). Layers are created ONCE.
   DiversityPenalty     the add_loss penalty (version 1 and 2 both use it)
   EnsembleAverage      average of the experts' scores, used only for evaluation
-  mge_model()          wires a chosen subset of experts into a Model (version 1 = all, version 2 = growing subset)
+  mge_outputs()        wires a chosen subset of experts to the model outputs
+                       (version 1 = all experts, version 2 = a growing subset)
+The Keras model class that uses these pieces is MGEClassifier in models.py.
 """
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -36,12 +38,20 @@ def mge_expert(feature_map, n_classes, expert_drop, index):
     return layers.Dense(n_classes, name=f"expert_{index}_classifier")(x)     # scores (logits)
 
 
-def mge_graph(size, n_classes, augmentation=None, drop=0.1, expert_drop=0.3):
-    """Backbone + one expert at each of the three depths (64, 128, 256 channels).
-    Returns (input, [scores_0, scores_1, scores_2]); expert 0 is the shallowest, 2 the deepest."""
-    inp = tf.keras.Input((size, size, 3))
-    stages = backbone_multi_depth(inp, augmentation, drop)
-    expert_scores = [mge_expert(stage, n_classes, expert_drop, i) for i, stage in enumerate(stages)]
+def mge_graph(input_shape, classes, augmentation=None, drop=0.1, expert_drop=0.3, backbone=None):
+    """Backbone + one expert at each of the three depths (64, 128, 256 channels by default).
+    Returns (input, [scores_0, scores_1, scores_2]); expert 0 is the shallowest, 2 the deepest.
+    backbone: None for backbone_multi_depth(), or your own callable returning a list of 3 feature maps
+    (batch, H, W, C), shallow to deep."""
+    inp = tf.keras.Input(input_shape)
+    if backbone is None:
+        stages = backbone_multi_depth(inp, augmentation, drop)
+    else:
+        stages = backbone(augmentation(inp) if augmentation is not None else inp)
+        if not isinstance(stages, (list, tuple)) or len(stages) != 3 or any(len(s.shape) != 4 for s in stages):
+            raise ValueError("MGEClassifier needs a backbone that returns a list of exactly 3 feature maps "
+                             "(batch, H, W, C), shallow to deep")
+    expert_scores = [mge_expert(stage, classes, expert_drop, i) for i, stage in enumerate(stages)]
     return inp, expert_scores
 
 
@@ -90,13 +100,13 @@ class EnsembleAverage(layers.Layer):
         return tf.stop_gradient(tf.add_n(expert_scores) / len(expert_scores))
 
 
-def mge_model(inp, expert_scores, active, diversity_weight=0.1, direction="earlier_vs_later"):
-    """Wire the experts listed in `active` (e.g. [2, 1, 0]; order = order added) into a Model.
-    Outputs: [ensemble, expert_<i>, ...] in that order. All experts of `active` get the
-    diversity penalty. Layers are SHARED with any other model made from the same graph."""
+def mge_outputs(expert_scores, active, diversity_weight=0.1, direction="earlier_vs_later"):
+    """Wire the experts listed in `active` (e.g. [2, 1, 0]; order = order added) to the model outputs.
+    Returns the list [ensemble, expert_<i>, ...] in that order. All experts of `active` get the
+    diversity penalty. The expert layers themselves are SHARED with any other model made from the same graph."""
     chosen = [expert_scores[i] for i in active]
     chosen = DiversityPenalty(diversity_weight, direction, name="diversity")(chosen)
     outputs = [EnsembleAverage(name="ensemble")(chosen)]
     for i, scores in zip(active, chosen):
         outputs.append(layers.Identity(name=f"expert_{i}")(scores))     # named so history keys are readable
-    return tf.keras.Model(inp, outputs)
+    return outputs

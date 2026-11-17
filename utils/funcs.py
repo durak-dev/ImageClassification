@@ -11,6 +11,10 @@ from sklearn.model_selection import train_test_split
 
 import torch
 
+# Plotting lives in utils/plotting.py now. Re-exported here so older notebooks that do
+# `from utils.funcs import *` (plot_images, plot_history, first_name) keep working.
+from utils.plotting import plot_images, plot_history, first_name  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -253,53 +257,36 @@ def load_splits(data_dir, splits=SPLITS, label_file=LABELS_FILE, image_folder='i
     return pd.concat(parts, ignore_index=True)
 
 
-def first_name(description):
-    """'tabby, tabby cat' -> 'tabby'"""
-    return str(description).split(',')[0]
+def balance_frame(df, strategy="oversample", target=None, label_col="class_id", seed=42):
+    """Class-balanced, shuffled copy of df (use on the TRAIN frame only).
 
+    strategy: None | "oversample" | "undersample"   (None returns df unchanged)
+    target:   images per class. None -> max class count (oversample) or min class
+              count (undersample). Also "min" | "median" | "max" | an int.
+              Any target both oversamples the small classes and undersamples the
+              big ones, e.g. target="median" is a hybrid that keeps the epoch size.
+    Oversampling keeps every row, adds whole repeats, then draws the remainder
+    without replacement, so each image is used about equally often."""
+    if strategy is None:
+        return df
+    if strategy not in ("oversample", "undersample"):
+        raise ValueError(f"strategy must be None, 'oversample' or 'undersample', got {strategy!r}")
+    counts = df[label_col].value_counts()
+    if target is None:
+        target = "max" if strategy == "oversample" else "min"
+    if isinstance(target, str):
+        target = {"min": counts.min(), "median": counts.median(), "max": counts.max()}[target]
+    target = int(target)
 
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-def plot_images(data, path_col='path', title_cols=None, n=None, ncols=8,
-                size=2, shuffle=False, seed=0, transform=None):
-    """Plot images from a dataframe in a grid.
-
-    title_cols: a column name or a list of column names to show above each image.
-    n: how many images to show (default: all rows).
-    shuffle: pick random rows instead of the first ones.
-    transform: optional function applied to each image before showing it,
-               e.g. transform=denoise_image to see the corrected version.
-    """
-    if shuffle:
-        data = data.sample(frac=1, random_state=seed)
-    if n is not None:
-        data = data.head(n)
-    if isinstance(title_cols, str):
-        title_cols = [title_cols]
-
-    nrows = math.ceil(len(data) / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * size, nrows * size * 1.1),
-                             squeeze=False)
-    axes = axes.flatten()
-
-    for ax in axes:
-        ax.axis('off')
-
-    for i in range(len(data)):
-        row = data.iloc[i]
-        ax = axes[i]
-        image = np.array(Image.open(row[path_col]).convert('RGB'))
-        if transform is not None:
-            image = transform(image)
-        ax.imshow(image)
-        if title_cols:
-            title = '\n'.join(first_name(row[c]) for c in title_cols)
-            ax.set_title(title, fontsize=8)
-
-    plt.tight_layout()
-    plt.show()
+    parts = []
+    for i, (_, g) in enumerate(df.groupby(label_col, sort=True)):
+        n = len(g)
+        if n >= target:
+            parts.append(g.sample(target, random_state=seed + i))
+        else:
+            reps, rest = divmod(target, n)
+            parts += [g] * reps + [g.sample(rest, random_state=seed + i)]
+    return pd.concat(parts).sample(frac=1, random_state=seed).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -668,15 +655,3 @@ def rebuild_corrected(fixes, data_dir, labels_corrected=None, jpeg_quality=95, o
             part.drop(columns='split').to_csv(
                 os.path.join(split_dir(data_dir, split, 'labels'), CORRECTED_LABELS_FILE), index=False)
         print('labels_corrected.csv written for', ', '.join(sorted(labels_corrected['split'].unique())))
-
-
-def plot_history(history):
-    h = history.history if hasattr(history, "history") else history
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-    ax[0].plot(h["loss"], label="train"); ax[0].plot(h["val_loss"], label="val")
-    ax[0].set(title="Loss", xlabel="epoch"); ax[0].legend()
-    if "val_f1" in h:
-        ax[1].plot(h["val_f1"], color="C2", marker="o")
-        best = int(np.argmax(h["val_f1"]))
-        ax[1].set(title=f"Val macro-F1 (best {h['val_f1'][best]:.3f} @ epoch {best})", xlabel="epoch")
-    plt.tight_layout(); plt.show()
