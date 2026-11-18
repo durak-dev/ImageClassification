@@ -21,16 +21,18 @@ class MixtureOfExperts(layers.Layer):
         self.add_loss(self.balance * self.n_experts * tf.reduce_sum(usage ** 2))
         return tf.einsum("be,bec->bc", g, e)                      # weighted sum of expert scores
 
-def res_block(x, filters, downsample=True):
+def res_block(x, filters, downsample=True, l2=0.0):
+    """Residual block. l2 > 0 adds an L2 weight penalty on every conv kernel of the block."""
+    reg = tf.keras.regularizers.l2(l2) if l2 else None
     stride = 2 if downsample else 1
     shortcut = x
-    y = layers.Conv2D(filters, 3, strides=stride, padding="same", use_bias=False)(x)
+    y = layers.Conv2D(filters, 3, strides=stride, padding="same", use_bias=False, kernel_regularizer=reg)(x)
     y = layers.BatchNormalization()(y)
     y = layers.ReLU()(y)
-    y = layers.Conv2D(filters, 3, padding="same", use_bias=False)(y)
+    y = layers.Conv2D(filters, 3, padding="same", use_bias=False, kernel_regularizer=reg)(y)
     y = layers.BatchNormalization()(y)
     if stride != 1 or shortcut.shape[-1] != filters:
-        shortcut = layers.Conv2D(filters, 1, strides=stride, use_bias=False)(shortcut)
+        shortcut = layers.Conv2D(filters, 1, strides=stride, use_bias=False, kernel_regularizer=reg)(shortcut)
         shortcut = layers.BatchNormalization()(shortcut)
     return layers.ReLU()(layers.Add()([y, shortcut]))
 
