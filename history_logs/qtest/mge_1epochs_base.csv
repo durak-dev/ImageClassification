@@ -1,2 +1,0 @@
-epoch,ensemble_accuracy,ensemble_loss,expert_0_accuracy,expert_0_loss,expert_1_accuracy,expert_1_loss,expert_2_accuracy,expert_2_loss,loss,val_ensemble_accuracy,val_ensemble_loss,val_expert_0_accuracy,val_expert_0_loss,val_expert_1_accuracy,val_expert_1_loss,val_expert_2_accuracy,val_expert_2_loss,val_f1,val_loss
-0,0.0078125,5.571419715881348,0.01171875,5.89963436126709,0.0,6.189306259155273,0.005859375,6.0380778312683105,23.738361358642578,0.0,1370.25341796875,0.0,6.442337989807129,0.0,195.1356658935547,0.0,3946.159912109375,0.0,5517.9912109375

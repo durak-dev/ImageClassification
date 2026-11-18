@@ -60,6 +60,22 @@ The split is reproducible: it is stored in `data/split_manifest.csv` and reused 
 2. *(Optional)* *Runtime → Change runtime type → GPU* to speed up CLIP.
 3. Run the cells top to bottom. The setup cell detects Colab and clones the repo into `/content/ImageClassification`. The split folders are recreated from `data/original` and `data/split_manifest.csv`, so you get exactly the same split as everyone else. Colab already has the required packages.
 
+## Run on RunPod with local VS Code
+
+The notebooks run in your local VS Code while the kernel runs on a RunPod GPU pod through an SSH tunnel. Run the scripts from PowerShell in the repo folder.
+
+1. Deploy a pod with the official **RunPod PyTorch** template (Community Cloud, no network volume).
+2. Copy the **"SSH over exposed TCP"** line from the pod's *Connect* tab (`ssh root@<ip> -p <port> ...`).
+3. Run `.\connect_pod.ps1 -Ip <ip> -Port <port>` and wait for **READY**. Keep that window open: it is the tunnel.
+4. In VS Code open a notebook, *Select Kernel* → *Existing Jupyter Server*, paste the URL (it is on the clipboard) and choose **"Python 3"**.
+5. Run the notebook.
+6. Run `.\pull_results.ps1 -Ip <ip> -Port <port>` to copy `checkpoints/`, `models/` and `history_logs/` from the pod into this folder.
+7. **Terminate** the pod (never *Stop* it).
+
+* The pod IP and port change with every new pod, so take them from the Connect tab each time.
+* `data/` and `utils/` must be on the pod. The bootstrap handles this through git (it clones or pulls the repo from GitHub), so push your changes before you connect. Local changes you have not pushed are not on the pod.
+* Pick the kernel **"Python 3"** from the Existing Jupyter Server, not "Pod Python". "Pod Python" is the kernel that `setup.sh` registers and is not needed here. The Jupyter server is started with `LD_LIBRARY_PATH` cleared, so every kernel it launches (including "Python 3") sees the GPU in TensorFlow. `connect_pod.ps1` prints a warning if TensorFlow finds no GPU.
+
 ## Saving checkpoints to GitHub (Colab)
 
 The Colab disk is wiped when the session ends. If GitHub credentials are configured, the notebook commits checkpoints (`checkpoints/df_fixed.csv`, `checkpoints/clip_results.csv`, corrected labels, split manifest) to GitHub instead of keeping them on the VM. Locally nothing is uploaded; checkpoints are plain files in `checkpoints/`.

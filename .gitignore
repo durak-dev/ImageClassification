@@ -9,3 +9,11 @@ data/test/
 
 # credentials - never commit
 .env
+
+# runpod
+connect_pod.ps1
+pull_results.ps1
+pod_bootstrap.sh
+setup.sh
+
+model/
