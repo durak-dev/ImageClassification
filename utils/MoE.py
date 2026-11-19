@@ -1,9 +1,12 @@
-import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score
+
+# Every build_* function takes `backbone_fn(inp, augmentation) -> [s1, s2, s3]` (three feature maps, shallow -> deep,
+# each (batch, H, W, C)); the notebooks pass their frozen saved backbone. CNN / MoE pool s3, pMoE reads s3 as patches,
+# MGE uses all three.
+
 
 class MixtureOfExperts(layers.Layer):
     def __init__(self, n_experts, n_classes, hidden=128, balance=0.05, drop=0.0, **kw):
@@ -36,71 +39,6 @@ def res_block(x, filters, downsample=True, l2=0.0):
         shortcut = layers.BatchNormalization()(shortcut)
     return layers.ReLU()(layers.Add()([y, shortcut]))
 
-def backbone(inp, augmentation=None, drop=0.1):
-    """Shared conv feature extractor -> 256 features. Used by BOTH models so the comparison is fair."""
-    x = augmentation(inp) if augmentation is not None else inp
-    x = layers.Rescaling(1 / 255)(x)
-    x = layers.Conv2D(32, 3, padding="same", use_bias=False)(x)     # stem
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = res_block(x, 32, downsample=False)
-    x = res_block(x, 64)
-    x = layers.SpatialDropout2D(drop)(x)
-    x = res_block(x, 128)
-    x = layers.SpatialDropout2D(drop)(x)
-    x = res_block(x, 256)
-    x = layers.GlobalAveragePooling2D()(x)
-    return layers.Dropout(drop * 2.5)(x)                             # feature dropout
-
-def backbone_maps(inp, augmentation=None, drop=0.1):
-    """Same layers as backbone(), but returns the 3 stage outputs [64, 128, 256 channels] (batch, H, W, C)."""
-    x = augmentation(inp) if augmentation is not None else inp
-    x = layers.Rescaling(1 / 255)(x)
-    x = layers.Conv2D(32, 3, padding="same", use_bias=False)(x)     # stem
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = res_block(x, 32, downsample=False)
-    s1 = res_block(x, 64)
-    s2 = res_block(layers.SpatialDropout2D(drop)(s1), 128)
-    s3 = res_block(layers.SpatialDropout2D(drop)(s2), 256)
-    return [s1, s2, s3]
-
-def get_maps(inp, backbone_fn=None, augmentation=None, drop=0.1):
-    """MGE: the 3 feature maps (shallow -> deep). backbone_fn=None: the default backbone above.
-    Your backbone_fn(inp, augmentation) must return a list of 3 maps (batch, H, W, C); it applies the
-    augmentation, rescaling and dropout itself, like backbone() does."""
-    if backbone_fn is None:
-        return backbone_maps(inp, augmentation, drop)
-    maps = backbone_fn(inp, augmentation)
-    assert isinstance(maps, (list, tuple)) and len(maps) == 3 and all(len(m.shape) == 4 for m in maps),         "the MGE backbone must return a list of 3 feature maps, each (batch, H, W, C), shallow -> deep"
-    return maps
-
-def get_map(inp, backbone_fn=None, augmentation=None, drop=0.1):
-    """pMoE: ONE feature map (batch, H, W, C), not pooled. backbone_fn(inp, augmentation) returns it."""
-    if backbone_fn is None:
-        return backbone_maps(inp, augmentation, drop)[-1]
-    x = backbone_fn(inp, augmentation)
-    assert len(x.shape) == 4, f"the pMoE backbone must return a feature map (batch, H, W, C), got {tuple(x.shape)}"
-    return x
-
-def features(inp, backbone_fn=None, augmentation=None, drop=0.1):
-    """CNN / MoE: a pooled feature vector (batch, F). backbone_fn(inp, augmentation) may return the vector
-    itself (like backbone()) or a feature map, which then gets global-average-pooled."""
-    if backbone_fn is None:
-        return backbone(inp, augmentation, drop)
-    x = backbone_fn(inp, augmentation)
-    if len(x.shape) == 4:
-        x = layers.GlobalAveragePooling2D()(x)
-    assert len(x.shape) == 2, f"the CNN/MoE backbone must return a vector (batch, F) or a map, got {tuple(x.shape)}"
-    return x
-
-def cosine_lr(peak, epochs, steps_per_epoch, warmup_epochs=1):
-    """Learning rate: linear warmup from 0 to `peak` over `warmup_epochs`, then cosine decay to 0 at `epochs`.
-    Pass it anywhere a learning rate is expected (lr=...); AdamW accepts a schedule directly."""
-    warmup = int(warmup_epochs * steps_per_epoch)
-    return tf.keras.optimizers.schedules.CosineDecay(
-        0.0, decay_steps=max(1, int(epochs * steps_per_epoch) - warmup), warmup_target=peak, warmup_steps=warmup)
-
 
 def sparse_ce(n_classes, label_smoothing=0.0):
     """Cross-entropy on integer labels and logits, with optional label smoothing
@@ -112,38 +50,35 @@ def sparse_ce(n_classes, label_smoothing=0.0):
     return loss
 
 
-def make_adamw(lr, weight_decay):
-    """AdamW without weight decay on biases and batch-norm parameters.
-    Keras applies lr * weight_decay per step, so a useful weight_decay is ~0.01-0.05 (1e-4 is practically none)."""
+def compile_head(m, lr, weight_decay):
+    """The compile every head uses. lr: a float or a schedule. AdamW applies lr * weight_decay per step;
+    biases and batch-norm parameters get no weight decay."""
     opt = tf.keras.optimizers.AdamW(lr, weight_decay=weight_decay)
     opt.exclude_from_weight_decay(var_names=["bias", "gamma", "beta"])
-    return opt
-
-
-def _compile(m, lr, weight_decay):
-    """lr: a float or a schedule (e.g. cosine_lr(...))."""
-    m.compile(make_adamw(lr, weight_decay),
-              tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-              metrics=["accuracy"])
+    m.compile(opt, tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
     return m
 
-def build_moe(size, n_classes, n_experts=4, balance=0.05, augmentation=None,
-              drop=0.1, expert_drop=0.3, lr=1e-3, weight_decay=1e-4, backbone_fn=None):
-    inp = tf.keras.Input((size, size, 3))
-    x = features(inp, backbone_fn, augmentation, drop)
-    out = MixtureOfExperts(n_experts, n_classes, balance=balance, drop=expert_drop, name="moe")(x)
-    return _compile(tf.keras.Model(inp, out), lr, weight_decay)
 
-def build_cnn(size, n_classes, n_experts=4, hidden=128, augmentation=None,
-              drop=0.1, head_drop=0.3, lr=1e-3, weight_decay=1e-4, backbone_fn=None):
-    """Baseline: same backbone, plain dense head sized to match the MoE's hidden units
-    (n_experts * hidden), so any difference comes from the mixture, not from capacity."""
+def build_moe(size, n_classes, backbone_fn, n_experts=4, balance=0.05, augmentation=None,
+              drop=0.3, expert_drop=0.3, lr=1e-3, weight_decay=1e-4):
+    """drop: dropout on the pooled s3 features."""
     inp = tf.keras.Input((size, size, 3))
-    x = features(inp, backbone_fn, augmentation, drop)
+    x = layers.GlobalAveragePooling2D()(backbone_fn(inp, augmentation)[-1])
+    x = layers.Dropout(drop)(x)
+    out = MixtureOfExperts(n_experts, n_classes, balance=balance, drop=expert_drop, name="moe")(x)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
+
+def build_cnn(size, n_classes, backbone_fn, n_experts=4, hidden=128, augmentation=None,
+              drop=0.3, head_drop=0.3, lr=1e-3, weight_decay=1e-4):
+    """Baseline: same backbone, plain dense head sized to match the MoE's hidden units
+    (n_experts * hidden), so any difference comes from the mixture, not from capacity. drop: dropout on the pooled s3."""
+    inp = tf.keras.Input((size, size, 3))
+    x = layers.GlobalAveragePooling2D()(backbone_fn(inp, augmentation)[-1])
+    x = layers.Dropout(drop)(x)
     x = layers.Dense(n_experts * hidden, activation="relu")(x)
     x = layers.Dropout(head_drop)(x)
     out = layers.Dense(n_classes)(x)
-    return _compile(tf.keras.Model(inp, out), lr, weight_decay)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
 
 # ---------------------------------------------------------------- pMoE: patch-level routing
 # (Chowdhury et al., ICML 2023). Every expert has its OWN router vector, scores all patches of the
@@ -193,27 +128,17 @@ def expert_choices(model, images, layer_name="pmoe"):
     _, top_idx, gates = layer.route(feature_map)
     return top_idx.numpy(), gates.numpy(), layer.grid
 
-def build_pmoe(size, n_classes, n_experts=4, l=8, hidden=64, augmentation=None, drop=0.1, expert_drop=0.3,
-               lr=1e-3, weight_decay=1e-4, backbone_fn=None):
+def build_pmoe(size, n_classes, backbone_fn, n_experts=4, l=8, hidden=64, augmentation=None, expert_drop=0.3,
+               lr=1e-3, weight_decay=1e-4):
     inp = tf.keras.Input((size, size, 3))
-    x = get_map(inp, backbone_fn, augmentation, drop)                # feature map, NOT pooled
+    x = backbone_fn(inp, augmentation)[-1]                         # s3 as a feature map, NOT pooled
     out = PatchMoE(n_experts, n_classes, l, hidden=hidden, drop=expert_drop, name="pmoe")(x)
-    return _compile(tf.keras.Model(inp, out), lr, weight_decay)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
 
 
 # ---------------------------------------------------------------- MGE: one expert per backbone depth
 # Zhang et al., ICCV 2019, adapted. UNVERIFIED guess: the diversity formula/direction/weight were not taken from the
-# paper (see utils/moe_project/mge.py). Penalty = exp(-KL(p_earlier || p_later)) averaged over expert pairs.
-def diversity_penalty_value(expert_scores, direction="earlier_vs_later"):
-    log_p = [tf.nn.log_softmax(s, axis=-1) for s in expert_scores]
-    values = []
-    for a in range(len(log_p)):
-        for b in range(a + 1, len(log_p)):
-            ref, other = (log_p[a], log_p[b]) if direction == "earlier_vs_later" else (log_p[b], log_p[a])
-            kl = tf.reduce_sum(tf.exp(ref) * (ref - other), axis=-1)       # KL(ref || other), (batch,)
-            values.append(tf.reduce_mean(tf.exp(-kl)))
-    return tf.add_n(values) / len(values)
-
+# paper. Penalty = exp(-KL(p_earlier || p_later)) averaged over expert pairs.
 class DiversityPenalty(layers.Layer):
     """Pass-through: adds weight * penalty to the loss and returns the expert scores unchanged."""
     def __init__(self, weight=0.1, direction="earlier_vs_later", **kw):
@@ -221,7 +146,14 @@ class DiversityPenalty(layers.Layer):
         self.weight, self.direction = weight, direction
 
     def call(self, expert_scores):
-        self.add_loss(self.weight * diversity_penalty_value(expert_scores, self.direction))
+        log_p = [tf.nn.log_softmax(s, axis=-1) for s in expert_scores]
+        values = []
+        for a in range(len(log_p)):
+            for b in range(a + 1, len(log_p)):
+                ref, other = (log_p[a], log_p[b]) if self.direction == "earlier_vs_later" else (log_p[b], log_p[a])
+                kl = tf.reduce_sum(tf.exp(ref) * (ref - other), axis=-1)       # KL(ref || other), (batch,)
+                values.append(tf.reduce_mean(tf.exp(-kl)))
+        self.add_loss(self.weight * tf.add_n(values) / len(values))
         return [tf.identity(s) for s in expert_scores]
 
 class EnsembleAverage(layers.Layer):
@@ -241,14 +173,14 @@ class MultiOutputModel(tf.keras.Model):
     def compute_metrics(self, x, y, y_pred, sample_weight=None):
         return super().compute_metrics(x, [y] * len(self.outputs), y_pred, sample_weight)
 
-def build_mge(size, n_classes, diversity_weight=0.1, direction="earlier_vs_later", augmentation=None, drop=0.1,
-              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, backbone_fn=None, proj=256):
+def build_mge(size, n_classes, backbone_fn, diversity_weight=0.1, direction="earlier_vs_later", augmentation=None,
+              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, proj=256):
     """Outputs: ensemble, expert_0 (shallowest), expert_1, expert_2 (deepest). Each expert pools its own map.
     proj: each expert first applies a trainable 1x1 conv (proj channels) + BN + ReLU to its map, so the shallow
     experts are not limited to the raw average of a 32/64-channel map. proj=None: no projection (old behaviour)."""
     inp = tf.keras.Input((size, size, 3))
     scores = []
-    for i, fmap in enumerate(get_maps(inp, backbone_fn, augmentation, drop)):
+    for fmap in backbone_fn(inp, augmentation):
         if proj:
             fmap = layers.Conv2D(proj, 1, use_bias=False)(fmap)
             fmap = layers.ReLU()(layers.BatchNormalization()(fmap))
@@ -257,25 +189,26 @@ def build_mge(size, n_classes, diversity_weight=0.1, direction="earlier_vs_later
         scores.append(layers.Dense(n_classes)(x))
     scores = DiversityPenalty(diversity_weight, direction, name="diversity")(scores)
     outs = [EnsembleAverage(name="ensemble")(scores)] + [layers.Identity(name=f"expert_{i}")(s) for i, s in enumerate(scores)]
-    return _compile(MultiOutputModel(inp, outs, name="mge"), lr, weight_decay)
+    return compile_head(MultiOutputModel(inp, outs, name="mge"), lr, weight_decay)
 
 
 class GateMonitor(tf.keras.callbacks.Callback):
+    """MoE only. After every epoch: the average gate weight per expert on val_ds, written into the epoch logs as
+    gate_usage_<i>, plus gate_balance (1.0 = perfectly even, 0.0 = one expert takes everything). Put it before
+    CSVLogger, so these columns land in the CSV log."""
     def __init__(self, val_ds, batches=20):
         super().__init__()
-        self.val_ds, self.batches, self.usage, self.entropy = val_ds.take(batches), batches, [], []
+        self.val_ds = val_ds.take(batches)
 
     def on_train_begin(self, logs=None):
-        moe = self.model.get_layer("moe")
-        self.feat = tf.keras.Model(self.model.input, moe.input)
+        self.feat = tf.keras.Model(self.model.input, self.model.get_layer("moe").input)
 
     def on_epoch_end(self, epoch, logs=None):
-        moe = self.model.get_layer("moe")
-        g = moe.gate(self.feat.predict(self.val_ds, verbose=0)).numpy()
+        g = self.model.get_layer("moe").gate(self.feat.predict(self.val_ds, verbose=0)).numpy()
         u = g.mean(0)
-        self.usage.append(u)
-        # 1.0 = perfectly even, 0.0 = one expert takes everything
-        self.entropy.append(float(-(u * np.log(u + 1e-9)).sum() / np.log(len(u))))
+        balance = float(-(u * np.log(u + 1e-9)).sum() / np.log(len(u)))
+        if logs is not None:
+            logs.update({f"gate_usage_{i}": float(v) for i, v in enumerate(u)}, gate_balance=balance)
         print(f"  usage {u.round(2)}  wins {np.bincount(g.argmax(1), minlength=len(u))}")
 
 
@@ -295,19 +228,3 @@ class MacroF1(tf.keras.callbacks.Callback):
         if logs is not None:
             logs["val_f1"] = f1                  # lands in history.history
         print(f"  val macro-F1 {f1:.4f}")
-
-
-def default_callbacks(val_ds, name="model", log_dir="history_logs", patience=8, gate=False):
-    """Standard callbacks for fit(): val macro-F1, a per-epoch history CSV
-    (log_dir/<name>.csv, survives a crashed Colab session) and early stopping.
-    gate=True also adds GateMonitor (MoE only). Returns (callbacks, gate_monitor or None).
-    MacroF1 must come before CSVLogger so that val_f1 ends up in the CSV."""
-    os.makedirs(log_dir, exist_ok=True)
-    mon = GateMonitor(val_ds) if gate else None
-    cbs = ([mon] if gate else []) + [
-        MacroF1(val_ds),
-        tf.keras.callbacks.CSVLogger(os.path.join(log_dir, f"{name}.csv")),
-        tf.keras.callbacks.EarlyStopping(patience=patience, restore_best_weights=True)]
-    return cbs, mon
-
-

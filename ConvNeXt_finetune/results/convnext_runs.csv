@@ -1,0 +1,5 @@
+time,experiment,split,accuracy,top5_accuracy,macro_f1,trainable_weights,notes
+2026-11-19 17:15,E7-ConvNeXtTiny,val,0.712,0.8401,0.6757,27973928,"224px, full fine-tune, head 10ep, cosine 10ep peak 5e-05, wd 0.05, ls 0.1, mixup 0.2, best epoch 10"
+2026-11-19 17:15,E7-ConvNeXtTiny +TTA,val,0.7148,0.8426,0.6784,27973928,"224px, full fine-tune, head 10ep, cosine 10ep peak 5e-05, wd 0.05, ls 0.1, mixup 0.2, best epoch 10"
+2026-11-19 17:15,E7-ConvNeXtTiny,test,0.7002,0.8266,0.6626,27973928,final test
+2026-11-19 17:15,E7-ConvNeXtTiny +TTA,test,0.7017,0.8311,0.6635,27973928,final test

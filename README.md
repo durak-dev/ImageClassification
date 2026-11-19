@@ -32,6 +32,16 @@ If your files are still in `data/images` and `data/labels.csv`, move them to `da
 
 The split is reproducible: it is stored in `data/split_manifest.csv` and reused on later runs. Delete that file only if you want a new split.
 
+## Model notebooks (run after `Preprocessing.ipynb`)
+
+| notebook | what it does |
+|---|---|
+| `MoE_comparisons.ipynb` | trains one ResNet backbone (or loads a saved one), then compares four heads on it: CNN, MoE, pMoE, MGE |
+| `pMoE_MGE_finetune_v2.ipynb` | trains pMoE and MGE with several head settings on a backbone |
+| `ConvNeXt_finetune.ipynb` | fine-tunes a pretrained ConvNeXt-Tiny (head first, then the whole network). Runs on Colab or on a RunPod pod; writes `ConvNeXt_finetune/models/` (weights, about 110 MB, too big for GitHub) and `ConvNeXt_finetune/results/` (run log) |
+
+Each notebook writes its logs and weights to its own output folder, named like the notebook (`MoE_comparisons/` and `pMoE_MGE_finetune_v2/`, each with `models/` and `history_logs/`). The notebooks are independent: the only thing they can share is a **backbone file**. A backbone is saved as a complete Keras model (`<name>.keras`, layers and weights), so a notebook can load it without the code that built it. In the cell *Choose the backbone*, write the path (relative to the project folder) in `BACKBONE_PATH`, e.g. `'MoE_comparisons/models/backbone_6072k_20251118-210000.keras'`, or leave it `None` to train a new backbone, which is saved under an automatic name. The backbone is **frozen**: heads train only their own layers, so any head can be retrained without touching the backbone. The helpers are in `utils/resnet.py`. (`MoE_approach.ipynb` and `pMoE_MGE_finetune.ipynb` are the first versions of these notebooks and use the old `models/` and `history_logs/` folders.)
+
 ## Option A – Run locally (GPU or CPU)
 
 1. Clone the repo and enter it:
@@ -69,11 +79,12 @@ The notebooks run in your local VS Code while the kernel runs on a RunPod GPU po
 3. Run `.\connect_pod.ps1 -Ip <ip> -Port <port>` and wait for **READY**. Keep that window open: it is the tunnel.
 4. In VS Code open a notebook, *Select Kernel* → *Existing Jupyter Server*, paste the URL (it is on the clipboard) and choose **"Python 3"**.
 5. Run the notebook.
-6. Run `.\pull_results.ps1 -Ip <ip> -Port <port>` to copy `checkpoints/`, `models/` and `history_logs/` from the pod into this folder.
+6. Run `.\pull_results.ps1 -Ip <ip> -Port <port>` to copy `checkpoints/` and the `models/` and `history_logs/` folders of each notebook from the pod into this folder.
 7. **Terminate** the pod (never *Stop* it).
 
 * The pod IP and port change with every new pod, so take them from the Connect tab each time.
 * `data/` and `utils/` must be on the pod. The bootstrap handles this through git (it clones or pulls the repo from GitHub), so push your changes before you connect. Local changes you have not pushed are not on the pod.
+* Results survive terminating the pod: `pull_results.ps1` copies them to your PC, and on the next pod `connect_pod.ps1` uploads the saved backbones (`<notebook folder>/models/*.keras`) and the training logs (`<notebook folder>/history_logs/*.csv`) again.
 * Pick the kernel **"Python 3"** from the Existing Jupyter Server, not "Pod Python". "Pod Python" is the kernel that `setup.sh` registers and is not needed here. The Jupyter server is started with `LD_LIBRARY_PATH` cleared, so every kernel it launches (including "Python 3") sees the GPU in TensorFlow. `connect_pod.ps1` prints a warning if TensorFlow finds no GPU.
 
 ## Saving checkpoints to GitHub (Colab)
