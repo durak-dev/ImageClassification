@@ -94,8 +94,35 @@ def features(inp, backbone_fn=None, augmentation=None, drop=0.1):
     assert len(x.shape) == 2, f"the CNN/MoE backbone must return a vector (batch, F) or a map, got {tuple(x.shape)}"
     return x
 
+def cosine_lr(peak, epochs, steps_per_epoch, warmup_epochs=1):
+    """Learning rate: linear warmup from 0 to `peak` over `warmup_epochs`, then cosine decay to 0 at `epochs`.
+    Pass it anywhere a learning rate is expected (lr=...); AdamW accepts a schedule directly."""
+    warmup = int(warmup_epochs * steps_per_epoch)
+    return tf.keras.optimizers.schedules.CosineDecay(
+        0.0, decay_steps=max(1, int(epochs * steps_per_epoch) - warmup), warmup_target=peak, warmup_steps=warmup)
+
+
+def sparse_ce(n_classes, label_smoothing=0.0):
+    """Cross-entropy on integer labels and logits, with optional label smoothing
+    (Keras 3's SparseCategoricalCrossentropy has no label_smoothing)."""
+    def loss(y_true, y_pred):
+        y = tf.one_hot(tf.cast(tf.reshape(y_true, [-1]), tf.int32), n_classes)
+        return tf.keras.losses.categorical_crossentropy(y, tf.cast(y_pred, tf.float32), from_logits=True,
+                                                        label_smoothing=label_smoothing)
+    return loss
+
+
+def make_adamw(lr, weight_decay):
+    """AdamW without weight decay on biases and batch-norm parameters.
+    Keras applies lr * weight_decay per step, so a useful weight_decay is ~0.01-0.05 (1e-4 is practically none)."""
+    opt = tf.keras.optimizers.AdamW(lr, weight_decay=weight_decay)
+    opt.exclude_from_weight_decay(var_names=["bias", "gamma", "beta"])
+    return opt
+
+
 def _compile(m, lr, weight_decay):
-    m.compile(tf.keras.optimizers.AdamW(lr, weight_decay=weight_decay),
+    """lr: a float or a schedule (e.g. cosine_lr(...))."""
+    m.compile(make_adamw(lr, weight_decay),
               tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
               metrics=["accuracy"])
     return m
@@ -154,7 +181,7 @@ class PatchMoE(layers.Layer):
         scores = []
         for i in range(self.n_experts):
             h = self.drop_layers[i](self.hidden_layers[i](chosen[:, i]), training=training)   # (batch, l, hidden)
-            pooled = tf.reduce_sum(h * gates[:, i, :, None], axis=1) / self.l                  # gate-weighted, 1/l
+            pooled = tf.reduce_sum(h * gates[:, i, :, None], axis=1)   # gate-weighted average (gates already sum to 1)
             scores.append(self.out_layers[i](pooled))
         return tf.add_n(scores)                                       # experts are ADDED, as in the paper
 
@@ -215,11 +242,16 @@ class MultiOutputModel(tf.keras.Model):
         return super().compute_metrics(x, [y] * len(self.outputs), y_pred, sample_weight)
 
 def build_mge(size, n_classes, diversity_weight=0.1, direction="earlier_vs_later", augmentation=None, drop=0.1,
-              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, backbone_fn=None):
-    """Outputs: ensemble, expert_0 (shallowest), expert_1, expert_2 (deepest). Each expert pools its own map."""
+              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, backbone_fn=None, proj=256):
+    """Outputs: ensemble, expert_0 (shallowest), expert_1, expert_2 (deepest). Each expert pools its own map.
+    proj: each expert first applies a trainable 1x1 conv (proj channels) + BN + ReLU to its map, so the shallow
+    experts are not limited to the raw average of a 32/64-channel map. proj=None: no projection (old behaviour)."""
     inp = tf.keras.Input((size, size, 3))
     scores = []
     for i, fmap in enumerate(get_maps(inp, backbone_fn, augmentation, drop)):
+        if proj:
+            fmap = layers.Conv2D(proj, 1, use_bias=False)(fmap)
+            fmap = layers.ReLU()(layers.BatchNormalization()(fmap))
         x = layers.GlobalAveragePooling2D()(fmap)
         x = layers.Dropout(expert_drop)(x)
         scores.append(layers.Dense(n_classes)(x))
