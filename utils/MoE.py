@@ -4,7 +4,7 @@ from tensorflow.keras import layers
 from sklearn.metrics import f1_score
 
 # Every build_* function takes `backbone_fn(inp, augmentation) -> [s1, s2, s3]` (three feature maps, shallow -> deep,
-# each (batch, H, W, C)); the notebooks pass their frozen saved backbone. CNN / MoE pool s3, pMoE reads s3 as patches,
+# each (batch, H, W, C)); the notebooks pass a frozen saved backbone or a fresh trainable one. CNN / MoE pool s3, pMoE reads s3 as patches,
 # MGE uses all three.
 
 
@@ -50,26 +50,32 @@ def sparse_ce(n_classes, label_smoothing=0.0):
     return loss
 
 
-def compile_head(m, lr, weight_decay):
+def compile_head(m, lr, weight_decay, label_smoothing=0.0):
     """The compile every head uses. lr: a float or a schedule. AdamW applies lr * weight_decay per step;
-    biases and batch-norm parameters get no weight decay."""
+    biases and batch-norm parameters get no weight decay.
+    label_smoothing > 0 (e.g. 0.1): the target puts a little weight on every class, so a wrong label
+    pulls the model less hard. The loss values then have a higher floor, so compare runs by val F1."""
     opt = tf.keras.optimizers.AdamW(lr, weight_decay=weight_decay)
     opt.exclude_from_weight_decay(var_names=["bias", "gamma", "beta"])
-    m.compile(opt, tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+    if label_smoothing:
+        loss = sparse_ce(m.outputs[0].shape[-1], label_smoothing)    # n_classes = width of the (first) output
+    else:
+        loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    m.compile(opt, loss, metrics=["accuracy"])
     return m
 
 
 def build_moe(size, n_classes, backbone_fn, n_experts=4, balance=0.05, augmentation=None,
-              drop=0.3, expert_drop=0.3, lr=1e-3, weight_decay=1e-4):
+              drop=0.3, expert_drop=0.3, lr=1e-3, weight_decay=1e-4, label_smoothing=0.0):
     """drop: dropout on the pooled s3 features."""
     inp = tf.keras.Input((size, size, 3))
     x = layers.GlobalAveragePooling2D()(backbone_fn(inp, augmentation)[-1])
     x = layers.Dropout(drop)(x)
     out = MixtureOfExperts(n_experts, n_classes, balance=balance, drop=expert_drop, name="moe")(x)
-    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay, label_smoothing)
 
 def build_cnn(size, n_classes, backbone_fn, n_experts=4, hidden=128, augmentation=None,
-              drop=0.3, head_drop=0.3, lr=1e-3, weight_decay=1e-4):
+              drop=0.3, head_drop=0.3, lr=1e-3, weight_decay=1e-4, label_smoothing=0.0):
     """Baseline: same backbone, plain dense head sized to match the MoE's hidden units
     (n_experts * hidden), so any difference comes from the mixture, not from capacity. drop: dropout on the pooled s3."""
     inp = tf.keras.Input((size, size, 3))
@@ -78,7 +84,7 @@ def build_cnn(size, n_classes, backbone_fn, n_experts=4, hidden=128, augmentatio
     x = layers.Dense(n_experts * hidden, activation="relu")(x)
     x = layers.Dropout(head_drop)(x)
     out = layers.Dense(n_classes)(x)
-    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay, label_smoothing)
 
 # ---------------------------------------------------------------- pMoE: patch-level routing
 # (Chowdhury et al., ICML 2023). Every expert has its OWN router vector, scores all patches of the
@@ -128,12 +134,16 @@ def expert_choices(model, images, layer_name="pmoe"):
     _, top_idx, gates = layer.route(feature_map)
     return top_idx.numpy(), gates.numpy(), layer.grid
 
-def build_pmoe(size, n_classes, backbone_fn, n_experts=4, l=8, hidden=64, augmentation=None, expert_drop=0.3,
-               lr=1e-3, weight_decay=1e-4):
+def build_pmoe(size, n_classes, backbone_fn, n_experts=4, l=8, hidden=64, augmentation=None, drop=0.0,
+               expert_drop=0.3, lr=1e-3, weight_decay=1e-4, label_smoothing=0.0):
+    """drop: SpatialDropout2D on s3 (drops whole channels across all patches), the counterpart of the CNN / MoE
+    dropout on the pooled s3. expert_drop: dropout inside each expert."""
     inp = tf.keras.Input((size, size, 3))
     x = backbone_fn(inp, augmentation)[-1]                         # s3 as a feature map, NOT pooled
+    if drop:
+        x = layers.SpatialDropout2D(drop)(x)
     out = PatchMoE(n_experts, n_classes, l, hidden=hidden, drop=expert_drop, name="pmoe")(x)
-    return compile_head(tf.keras.Model(inp, out), lr, weight_decay)
+    return compile_head(tf.keras.Model(inp, out), lr, weight_decay, label_smoothing)
 
 
 # ---------------------------------------------------------------- MGE: one expert per backbone depth
@@ -174,7 +184,7 @@ class MultiOutputModel(tf.keras.Model):
         return super().compute_metrics(x, [y] * len(self.outputs), y_pred, sample_weight)
 
 def build_mge(size, n_classes, backbone_fn, diversity_weight=0.1, direction="earlier_vs_later", augmentation=None,
-              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, proj=256):
+              expert_drop=0.3, lr=1e-3, weight_decay=1e-4, proj=256, label_smoothing=0.0):
     """Outputs: ensemble, expert_0 (shallowest), expert_1, expert_2 (deepest). Each expert pools its own map.
     proj: each expert first applies a trainable 1x1 conv (proj channels) + BN + ReLU to its map, so the shallow
     experts are not limited to the raw average of a 32/64-channel map. proj=None: no projection (old behaviour)."""
@@ -189,7 +199,7 @@ def build_mge(size, n_classes, backbone_fn, diversity_weight=0.1, direction="ear
         scores.append(layers.Dense(n_classes)(x))
     scores = DiversityPenalty(diversity_weight, direction, name="diversity")(scores)
     outs = [EnsembleAverage(name="ensemble")(scores)] + [layers.Identity(name=f"expert_{i}")(s) for i, s in enumerate(scores)]
-    return compile_head(MultiOutputModel(inp, outs, name="mge"), lr, weight_decay)
+    return compile_head(MultiOutputModel(inp, outs, name="mge"), lr, weight_decay, label_smoothing)
 
 
 class GateMonitor(tf.keras.callbacks.Callback):

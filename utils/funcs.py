@@ -352,23 +352,17 @@ def noise_level(gray, block=8, flat_fraction=0.2):
     return float(np.sqrt(np.pi / 2) / 6 * flat.mean())
 
 
-def inspect_images(df, checks=('noise', 'blur', 'contrast'), path_col='path',
-                   noise_threshold=2.0, blur_threshold=2.0, contrast_threshold=12.0,
-                   high_contrast_threshold=31.0):
+def inspect_images(df, checks=('noise', 'blur'), path_col='path', noise_threshold=2.0, blur_threshold=2.0):
     """Run the chosen quality checks on every image in df.
 
-    All scores (and thresholds) are in readable units:
-      noise    = grain: noise sigma as % of the 0-255 brightness range  (higher = grainier)
-                 ~0.5 clean, 2 slightly grainy, 4+ visibly grainy
-      blur     = sharpness: log10 of the Laplacian variance, 1 step = 10x  (LOWER = blurrier)
-                 ~1 very blurry, 2 soft, 4 sharp
-      contrast = brightness spread (std) as % of the 0-255 range  (lower = flatter)
-                 ~10 washed out, 20 normal, 30+ harsh
+    Both scores (and thresholds) are in readable units:
+      noise = grain: noise sigma as % of the 0-255 brightness range  (higher = grainier)
+              ~0.5 clean, 2 slightly grainy, 4+ visibly grainy
+      blur  = sharpness: log10 of the Laplacian variance, 1 step = 10x  (LOWER = blurrier)
+              ~1 very blurry, 2 soft, 4 sharp
 
-    checks: any of 'noise', 'blur', 'contrast'.
+    checks: any of 'noise', 'blur'.
     noise_threshold: above this -> is_noisy.        blur_threshold: below this -> is_blurry.
-    contrast_threshold: below this -> is_low_contrast.
-    high_contrast_threshold: above this -> is_high_contrast.
     Returns a DataFrame with the same index as df, holding the path, the scores
     and the boolean flags. Merge it back with: df = df.join(quality.drop(columns='path'))
     """
@@ -386,12 +380,6 @@ def inspect_images(df, checks=('noise', 'blur', 'contrast'), path_col='path',
             # variance of the Laplacian (edge detector): sharp images have strong edges. LOWER = blurrier
             row['blur'] = float(np.log10(max(cv2.Laplacian(gray, cv2.CV_64F).var(), 1e-6)))
             row['is_blurry'] = row['blur'] < blur_threshold
-
-        if 'contrast' in checks:
-            # RMS contrast = std of the pixel values. LOWER = flatter / washed out, HIGHER = harsher
-            row['contrast'] = 100 * float(gray.std()) / 255
-            row['is_low_contrast'] = row['contrast'] < contrast_threshold
-            row['is_high_contrast'] = row['contrast'] > high_contrast_threshold
 
         rows.append(row)
 
@@ -434,29 +422,6 @@ def deblur_image(image, amount=1.0, radius=1.0):
     return cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
 
 
-def adjust_contrast(image, clip_limit=2.0, tile_grid=4):
-    """Boost local contrast with CLAHE (contrast-limited adaptive histogram
-    equalisation) on the lightness channel only, so colours are not shifted.
-    The image is split into tile_grid x tile_grid tiles that are equalised
-    separately; `clip_limit` caps how much a tile's histogram may be stretched,
-    which stops noise in flat areas from being blown up. Higher = stronger."""
-    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(tile_grid, tile_grid))
-    lab[..., 0] = clahe.apply(lab[..., 0])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
-def reduce_contrast(image, scale=0.8):
-    """Tone down harsh contrast: pull the lightness of every pixel towards the
-    image's average lightness, L = mean + scale * (L - mean). Only the lightness
-    channel changes, so colours are not shifted.
-    scale = 1 leaves the image unchanged, 0.8 keeps 80% of the contrast."""
-    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lightness = lab[..., 0]
-    lab[..., 0] = lightness.mean() + scale * (lightness - lightness.mean())
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
-
-
 def severity(ratio, max_ratio):
     """Map a 'how many times worse than the threshold' ratio to a 0-1 severity.
 
@@ -471,47 +436,40 @@ def severity(ratio, max_ratio):
 
 
 # strength columns written by fix_flagged_images (0 = step not applied)
-FIX_COLUMNS = ('denoise_strength', 'denoise_blend', 'contrast_clip', 'contrast_blend',
-               'contrast_scale', 'deblur_amount')
+FIX_COLUMNS = ('denoise_strength', 'denoise_blend', 'deblur_amount')
 
 
-def apply_fixes(image, denoise_strength=0, denoise_blend=0, contrast_clip=0, contrast_blend=0,
-                contrast_scale=0, deblur_amount=0):
+def apply_fixes(image, denoise_strength=0, denoise_blend=0, deblur_amount=0):
     """Run the corrections with given strengths (0 = skip that step), in the order
-    denoise -> contrast -> sharpen. fix_flagged_images works the strengths out per
-    image; rebuild_corrected replays the stored ones."""
+    denoise -> sharpen. fix_flagged_images works the strengths out per image;
+    rebuild_corrected replays the stored ones."""
     if denoise_strength:
         cleaned = denoise_image(image, strength=denoise_strength)
         image = np.clip(denoise_blend * cleaned + (1 - denoise_blend) * image, 0, 255).astype(np.uint8)
-    if contrast_clip:
-        boosted = adjust_contrast(image, clip_limit=contrast_clip)
-        image = np.clip(contrast_blend * boosted + (1 - contrast_blend) * image, 0, 255).astype(np.uint8)
-    if contrast_scale:
-        image = reduce_contrast(image, scale=contrast_scale)
     if deblur_amount:
         image = deblur_image(image, amount=deblur_amount)
     return image
 
 
 def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
-                       noise_threshold=None, blur_threshold=None, contrast_threshold=None,
-                       high_contrast_threshold=None,
+                       noise_threshold=None, blur_threshold=None,
                        denoise_scale=0.8, denoise_range=(3.0, 15.0), noise_max_ratio=4.0,
                        deblur_range=(0.5, 2.0), blur_max_drop=1.0,
-                       clip_range=(1.0, 3.0), contrast_max_ratio=2.0, min_contrast_scale=0.6,
                        jpeg_quality=95, copy_unflagged=True):
     """Apply corrections to every flagged image and save the result as a new file.
 
-    Uses the flag columns from inspect_images (is_noisy, is_blurry, is_low_contrast,
-    is_high_contrast) and the score columns 'noise' / 'blur' / 'contrast', in the
-    readable units of inspect_images. Use the SAME thresholds you gave to inspect_images.
+    Uses the flag columns from inspect_images (is_noisy, is_blurry) and the score
+    columns 'noise' / 'blur', in the readable units of inspect_images. Use the SAME
+    thresholds you gave to inspect_images.
 
     Every step is OFF unless you pass its threshold:
-      noise_threshold -> denoise,            blur_threshold -> sharpen,
-      contrast_threshold -> boost contrast,  high_contrast_threshold -> reduce contrast.
+      noise_threshold -> denoise,  blur_threshold -> sharpen.
     e.g. fix_flagged_images(df, out, noise_threshold=2.0) only denoises.
     An enabled step runs only for images whose flag is set, so clearing a flag in the
-    notebook (e.g. no contrast fix for noisy images) switches it off for that image.
+    notebook (e.g. no sharpening for noisy images) switches it off for that image.
+
+    There is no contrast step: an automatic contrast fix harmed black-and-white
+    images with clear contours.
 
     Denoising (noise = grain %, converted back to the sigma in gray levels):
       * filter strength h = denoise_scale * sigma, clipped to denoise_range (gray levels).
@@ -527,23 +485,13 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
         clipped to 0-1: full strength once an image is blur_max_drop log steps (default 1 = 10x)
         below the threshold. Reduced by 25% when the image is also noisy, because noise
         inflates the blur score.
-    Contrast (contrast = brightness spread %, lower = flatter):
-      * CLAHE on the lightness channel; its clip limit goes from clip_range[0]
-        to clip_range[1] with a log-scale severity of threshold / contrast, and
-        the result is blended with the original by the same severity (floored
-        at 0.3) so a barely-low-contrast image is only nudged.
-    Too much contrast (contrast > high_contrast_threshold):
-      * reduce_contrast with scale = high_contrast_threshold / contrast, i.e. the
-        image's contrast is brought back down to about the threshold; the scale is
-        never below min_contrast_scale, so no image loses more than 40% by default.
-    Order: denoise -> contrast -> sharpen, so later steps do not amplify grain.
+    Order: denoise -> sharpen, so sharpening does not amplify grain.
 
     With copy_unflagged=True the unflagged images are copied unchanged into
     out_folder, so out_folder holds the complete dataset (e.g. data/train/images_corrected).
     The original files are not touched. Returns a copy of df where 'path' points
-    to the file in out_folder, plus 'was_fixed', 'orig_path',
-    'denoise_strength', 'denoise_blend', 'contrast_clip', 'contrast_scale' and
-    'deblur_amount' (0 = step not applied).
+    to the file in out_folder, plus 'was_fixed', 'orig_path', 'denoise_strength',
+    'denoise_blend' and 'deblur_amount' (0 = step not applied).
     """
     os.makedirs(out_folder, exist_ok=True)
     df = df.copy()
@@ -552,7 +500,7 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
     was_fixed = np.zeros(len(df), dtype=bool)
     used = {c: np.zeros(len(df)) for c in FIX_COLUMNS}
 
-    if all(t is None for t in (noise_threshold, blur_threshold, contrast_threshold, high_contrast_threshold)):
+    if noise_threshold is None and blur_threshold is None:
         print("Warning: no threshold given, so no step is enabled - images are only copied")
 
     def flag(row, name, threshold, score):
@@ -563,10 +511,8 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
         row = df.iloc[i]
         noisy = flag(row, 'is_noisy', noise_threshold, 'noise')
         blurry = flag(row, 'is_blurry', blur_threshold, 'blur')
-        flat = flag(row, 'is_low_contrast', contrast_threshold, 'contrast')
-        harsh = flag(row, 'is_high_contrast', high_contrast_threshold, 'contrast')
 
-        if not (flat or harsh or noisy or blurry):
+        if not (noisy or blurry):
             if copy_unflagged:                          # nothing to fix: copy unchanged
                 dst = os.path.join(out_folder, os.path.basename(row[path_col]))
                 shutil.copy2(row[path_col], dst)
@@ -579,15 +525,6 @@ def fix_flagged_images(df, out_folder='data/images_corrected', path_col='path',
             sigma = float(row['noise']) * 255 / 100                 # grain % -> gray levels for the filter
             s['denoise_strength'] = float(np.clip(denoise_scale * sigma, *denoise_range))
             s['denoise_blend'] = max(0.3, severity(float(row['noise']) / noise_threshold, noise_max_ratio))
-
-        if flat:
-            sev = severity(contrast_threshold / max(float(row['contrast']), 1e-6), contrast_max_ratio)
-            s['contrast_clip'] = clip_range[0] + sev * (clip_range[1] - clip_range[0])
-            s['contrast_blend'] = max(0.3, sev)
-
-        if harsh:
-            s['contrast_scale'] = float(np.clip(high_contrast_threshold / float(row['contrast']),
-                                                min_contrast_scale, 1.0))
 
         if blurry:
             sev = float(np.clip((blur_threshold - float(row['blur'])) / blur_max_drop, 0.0, 1.0))
@@ -624,11 +561,6 @@ def rebuild_corrected(fixes, data_dir, labels_corrected=None, jpeg_quality=95, o
            means the rebuild finished.
     Needs data/{split}/images/ first: run materialize_splits(orig_dir, data_dir, manifest).
     Files that already exist are skipped (overwrite=False), so an interrupted run can resume."""
-    fixes = fixes.copy()
-    if 'contrast_blend' not in fixes.columns:           # older checkpoints: same formula as fix_flagged_images
-        fixes['contrast_blend'] = np.where(fixes['contrast_clip'] > 0,
-                                           np.maximum(0.3, (fixes['contrast_clip'] - 1.0) / 2.0), 0.0)
-
     for split, part in fixes.groupby('split'):
         src_dir, out_dir = split_dir(data_dir, split, 'images'), split_dir(data_dir, split, 'images_corrected')
         missing = set(part['filename']) - set(os.listdir(src_dir))
